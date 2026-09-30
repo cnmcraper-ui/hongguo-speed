@@ -15,6 +15,15 @@ jobs:
           git clone --recursive https://github.com/theos/theos.git "$HOME/theos"
           echo "THEOS=$HOME/theos" >> "$GITHUB_ENV"
           echo "$HOME/theos/bin" >> "$GITHUB_PATH"
+          if brew install ldid; then
+            echo "ldid from brew: $(command -v ldid)"
+          else
+            mkdir -p "$HOME/fakebin"
+            printf '#!/bin/sh\nexit 0\n' > "$HOME/fakebin/ldid"
+            chmod +x "$HOME/fakebin/ldid"
+            echo "$HOME/fakebin" >> "$GITHUB_PATH"
+            echo "::warning::ldid unavailable, signing skipped"
+          fi
 
       - name: Build
         run: |
