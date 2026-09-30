@@ -1,6 +1,7 @@
 # 红果短剧 倍速浮点插件（hongguospeed.dylib）
 
-给红果短剧（`com.phoenix.video`）加一个半透明悬浮圆钮，点一下在 **1.0 → 1.25 → 1.5 → 2.0 → 1.0** 之间循环。
+给红果短剧（`com.phoenix.video`）加一个半透明悬浮圆钮，点一下在红果自己那套档位里循环：
+**1.0 → 1.25 → 1.5 → 2.0 → 3.0 → 0.75 → 1.0**（0.75/1.0/1.25/1.5/2.0/3.0 全部补齐，和红果倍速菜单一致）。
 只做倍速，不碰广告、不碰会员字段。
 
 ## 现在这套文件里有什么
@@ -11,51 +12,103 @@
 | `Makefile` | Theos 编译配置（arm64，最低 iOS 14） |
 | `hongguospeed.plist` | 目标 App 白名单，写死红果的 bundle id |
 | `.github/workflows/build.yml` | 云端编译脚本，产出 `hongguospeed.dylib` |
-| `push-to-github.bat` | 双击运行，把本工程推到你自己的 GitHub 仓库触发编译 |
+| **`hongguospeed.dylib`** | **已经编好的成品，直接把这个文件传到手机用就行** |
+| `push-to-github.bat` | 备用：以后改过源码、要重新触发云端编译时用 |
 
-## 一、编译（这台 Windows 上没有 iOS 编译环境，走云端）
+## 一、成品已经有了（2026-09-30 第 10 次云端编译通过 = v5 探针版）
 
-1. 注册/登录 github.com，新建一个仓库，属性随意（建议 Private），不要勾选 "Add README"。
-2. 双击 `push-to-github.bat`，按提示粘贴仓库地址（形如 `https://github.com/你的用户名/hongguo-speed.git`）。
-   第一次推送会弹 GitHub 登录，用浏览器授权即可。
-3. 打开仓库页面 → `Actions` 标签 → 等这次运行变绿（约 2–4 分钟）。
-4. 点进这次运行，在页面底部 `Artifacts` 里下载 `hongguospeed-dylib`，解压得到 `hongguospeed.dylib`。
+`hongguospeed.dylib` 就在这个目录里，98,320 字节（SHA256 `f7de872a…1b12`），已验证：
+- Mach-O `MH_DYLIB`、单架构 **arm64**（非 arm64e）、`cpusubtype=0`，和红果主程序架构一致；
+- 依赖 `/libobjc.A.dylib`、`Foundation`、`UIKit`、`AVFoundation`，没有 `CydiaSubstrate`、没有 `libJailedShim`；
+- 运行时的实际表现见下面第四节，靠长按面板自证。
 
-如果 Actions 变红：点进那次运行 → `dylib` 这个 job → 把最后几十行日志发我，我改代码或改脚本。
+**改过 `SpeedBadge.m` 之后才需要重新编译**：把改动后的 `SpeedBadge.m`（和 `.github/workflows/build.yml` 如果也改了）用 GitHub 网页 `Add file → Upload files` 传到
+`https://github.com/cnmcraper-ui/hongguo-speed/upload/main/` 对应目录，commit 后 Actions 自动跑，约 1 分钟变绿 →
+点进那次运行 → 页面底部 `Artifacts` 下载 `hongguospeed-dylib` → 解压出 `hongguospeed.dylib`。
+
+如果 Actions 变红：点进那次运行，页面底部 `Annotations` 会把 `build.log` 里的报错行直接列出来（不用登录也能看），把那几行发我。
 
 ## 二、导入（巨魔注入器 / TrollFools）
 
 1. 打开巨魔注入器，选中 **红果短剧**。
-2. 添加 dylib：选刚下载的 `hongguospeed.dylib`。
+2. 添加 dylib：选本目录里的 `hongguospeed.dylib`（微信/QQ 传到手机后，在文件 App 里能查到）。
    本插件不依赖 `CydiaSubstrate`，也**不需要** `libJailedShim.dylib` 一起导入。
 3. 保存注入，重新打开红果。
 
 ## 三、使用
 
 - 屏幕右侧偏上有个半透明圆钮，显示当前倍率数字。
-- 点一下切换倍率，顺序 1 → 1.25 → 1.5 → 2 → 1。
+- 点一下切换倍率，顺序 1 → 1.25 → 1.5 → 2 → 3 → 0.75 → 1（档位和红果自己的倍速菜单一一对应）。
 - 按住拖动可以挪位置，松手不会切换倍率（拖动和点击是分开的）。
 - 数字变成 1 时，恢复红果自己的原始速度，插件不再干预。
-- **长按圆钮 0.6 秒**：弹出一块调试信息（12 秒后自动消失）。第一行是 `hook N | 实例 M`，
-  下面列出红果里实际存在的倍速接口类名。**第一次用先看这个，截图发我就能定位问题。**
+- **长按圆钮 0.6 秒**：弹出一块调试信息（12 秒后自动消失）。行依次是：
+  1. `hook N | 实例 M | 跳过 K | 溢出 D` —— 挂上了多少个方法、认出几个播放器对象、跳过多少个不能安全代写的、因容量不够被丢掉的；
+  2. `按 目标类 动作方法`（最近 3 次点按钮打到哪里）—— **红果自己的倍速菜单点下去时，它的入口方法名会出现在这里**；
+  3. `通知 名字 ×次数 对象类`（名字里带 speed 的 NSNotification）；
+  4. `实例1…实例4 <类名>` —— 插件登记下来的播放器对象；
+  5. **调用榜**：`类名.方法名 调X 推Y`，后面还会带线索：`于<子类>` = 实际接收者的类和挂的类不同、`=数值` = 最近一次写进去的数字、`收<类名>` = 这个 setter 收的是对象（显示 `收NSNumber` 就能按数字代写）。
+     `调X` = 红果自己调了几次，`推Y` = 插件往里写了几次；一条都没有时显示 `没有任何挂点被调用或推送过`。
+  **再长按一次会翻页列"最像播放器的那个类"上其余带 speed 的方法。有问题就长按截图发我。**
 
-想要"一打开就默认 1.5"：把 `SpeedBadge.m` 第 14 行的 `static int gRateIndex = 0;` 改成 `= 2;`，重新走一遍编译。
+想要"一打开就默认 1.5"：把 `SpeedBadge.m` 里 `static int gRateIndex = 0;` 那一行改成 `= 2;`，重新走一遍编译。
 
 ## 四、已验证 / 未验证（务必看清）
 
-已做的静态确认（依据你提供的脱壳包 `红果短剧-7.3.9..ipa`，只读分析、未安装）：
-- 主程序 `cryptid=0`，确认是真脱壳；bundle id `com.phoenix.video`，版本 7.3.9.32，已写进白名单。
-- 播放器是字节自研 **TTVideoEngine**，不是 `AVPlayer`。ObjC 符号表里明确存在
-  `-setPlaySpeed:`（参数类型 `double`）、`-setPlaySpeedWithRate:`、`-defaultPlaySpeed` / `-setDefaultPlaySpeed:`（`NSString`）、`-playSpeedBtnAction`，
-  以及 `BDAOVideoEngine`、`BDAOLandscapeSpeedSettingCell` 等倍速 UI 类。
-- 主程序是单架构 **arm64**（不是 arm64e），和 `Makefile` 的 `ARCHS = arm64` 对得上，注入后能被加载。
-- 所以本版把挂点从 `AVPlayer` 换成 `TTVideoEngine -setPlaySpeed:`（主），`BDAOVideoEngine`、`AVPlayer` 作兜底。
-- 工作方式：红果每次把速度写回 1.0（起播、切集、重置）时，插件替换成圆钮当前倍率，所以切集后不用重新点。
+已在真机确认（v2 的长按面板给出）：
+- 主程序 `cryptid=0`、bundle id `com.phoenix.video`、单架构 **arm64**（不是 arm64e），dylib 能被注入并加载运行（浮钮出现过）。
+- **`TTVideoEngine` 在运行时并不响应 `setPlaySpeed:`** —— 脱壳符号表里看到的"类归属"是错的。v2 因此 `hook 0 | 实例 0`，点了数字会跳但播放器没被写值。
+- 真机上实际带倍速 setter 的类：`SSPlayer`(`updatePlaySpeed:`)、`BDSCPlayer`、`BDSCAirPlayPlayer`、`BDLinkPlayer`、
+  `BDLEPlayer`、`BDDInaPlayer`、`BDByteCastPlayer`、`BDAirDisplayPlayer`、`TTVideoEngineEventBase`(`setPlaySpeed:`)。
+
+v3 的真机结果（v3 的长按面板给出，这一条改变了方向）：
+- 面板显示 `hook 32 | 实例 2 | 跳过 4`，浮钮数字会跳；但**用红果自己的倍速菜单把视频调到 2.0x 时，第二行仍是"还没拦到任何写入"**。
+- 也就是说：32 个 `setSpeed:` / `setRate:` / `updatePlaySpeed:` 一个都没被红果调用过。类名扫对了、实例也认出来了，唯独**倍速不在这条 ObjC 通道上**。
+- 最可能的两种解释：① 真正生效的是另一个名字里不含 speed 的方法（比如收到一个配置对象、或走 KMP/C++ 内核）；② 挂在了子类而红果调的是另一个兄弟类。v4 就是为了把这两种区分开。
+
+v4 的改法（广谱探针，先问清"红果到底调了哪个方法"）：
+- 不再只盯几个已知 setter：把所有名字含 `Player` / `Engine` / `Speed` 的类，**沿继承链**上每一个**返回值为 void** 且名字含 `speed` / `rate`（或叫 `setRate:` / `setPlaybackRate:` / `setPlayRate:` / `setTimeRate:` / `updateRate:` / `setRateValue:`）的方法全部挂上，参数是 `double` / `float` / `int`(百分数) / 对象的都能识别；`play` / `start` / `resumePlay` 也挂，但只登记实例不改行为。
+- 每个挂点带**调用计数**：红果调一次就 `调+1`，插件往里写一次就 `推+1`。长按面板直接按调用次数排出前 8 名，等于让红果自己点名。
+- 仍然只写标量参数的 setter；参数是对象的只记录"红果往这个方法塞了什么类"，不代写，避免塞错对象导致崩溃。
+- 只挂 `void` 返回值的方法（getter 一律不碰）：把返回 `double` 的取值方法换成空壳会让调用方读到脏数据。
+
+v4 的真机结果（**这一版没测出红果，是测出我自己的 bug**）：
+- 面板 `hook 96 | 实例 2 | 跳过 414`，调用榜里只有三条 `.start 调1`（`TTVideoEngineBatteryMonitor`、`TTVideoEngineCFHostDNS`、`OHREngine`），倍速相关全是 0。
+- **96 正好等于代码里 `gEntries` 数组的容量上限**，超出部分被静默丢弃 —— 也就是说红果真正的倍速 setter 很可能排在第 97 个之后，根本没挂上。"倍速不走 ObjC"这个结论**不成立**，撤回。
+- 认出的两个"实例"也是名字里带 Engine 的杂项类（电池监控、DNS 探测），不是播放器本体。
+
+v5 的改法：
+- 容量 96 → **1024**，并新增"溢出"计数：再被截断面板会直接显示数字，不会像这次一样把 bug 当成结论。
+- 扫描改成**可以反复跑**（记着哪些类扫过），红果懒加载出来的播放器类也补得上；点按钮和长按都会触发重扫。
+- 新增两个"问路"探针，专门对付"挂点全落空"这种情况：
+  - `-[UIApplication sendAction:to:from:forEvent:]`：App 里任何按钮点击都要过这里，面板会列出最近 3 次点击打到的**目标类 + 动作方法名**。红果自己的倍速菜单一点，它的入口方法就暴露了。
+  - `NSNotificationCenter` 的两个 post 方法：名字里带 speed 的通知会连对象类一起记下来（有些倍速是靠通知广播的）。
+  - 这两个只记录、不改行为，且原实现照常调用。
+- 最后一次写入改成只存指针、到面板才格式化，避免每帧调用都 alloc 字符串。
+- 已知盲点仍然保留：**返回非 void 的 setter（例如 `-(BOOL)setSpeed:`）会被跳过**，参数是结构体的也跳过 —— 这两类都记在"跳过"里。
+
+v5 的真机结果（**这一版问出答案了**）：
+- 面板 `hook 445 | 实例 6 | 跳过 414 | 溢出 0` —— 容量不再是瓶颈，红果的**真播放器现形**：
+  `TTVideoEngineOwnPlayer.setPlayerPlaybackSpeed: 调17 推0`、`TTVideoEngineOwnPlayer.setPlaybackSpeed: 调11 推0`。
+  调 17 次、推 0 次 = 红果确实在用这两个方法控制播放倍速（起播、切集、切档位都会调），而插件一次都没往里写过。
+- 为什么推不进去：这两个 setter 的参数是**对象**，v5 的对象参数挂点只记调用、不登记接收者，所以插件找不到可写的目标。
+- 同一屏里 `TTVideoEngineNetworkPortraitData.setNetSpeed: 推5`、`BDAOVideoNetworkSpeedSample.setSpeed: 推5` —— 插件把倍速写进了**网速**接口（名字带 speed 但不是播放倍速），这是有害的；`NSOperation.start 调736` 则是挂在通用祖先类上的纯噪音。
+- `按 …` 与 `通知 …` 两块一行都没出现（面板只在拦到东西时才打印），所以那次没证据说明红果的倍速菜单走 `sendAction:` 或走通知。既然 OwnPlayer 的 setter 已经就在眼前，v6 先直接打它。
+
+v6 的改法（目标：让 `推` 落到 OwnPlayer 上）：
+- 对象参数的 setter 也登记接收者；实测红果传进来的是 `NSNumber` 时，按当前倍速代写进去。
+- 每个挂点自己记住"最近调用者类 / 最近数值 / 最近传入对象类"，面板直接显示成 `于<子类>` `=数值` `收<类名>`；删掉全局"最后一次写入"那一行（它每秒被网速接口刷掉，只会误导）。
+- **只往播放倍速写**：方法名含 `play`，或挂的类名含 `player`，才允许写。`setNetSpeed:` 这类网速接口从此不再被污染。
+- `play/start` 不再挂到 `NSOperation` 这类通用祖先类；`Track` 只收名字像播放器（含 `Player` / `Engine` / `Speed`）的对象，40 个名额不再被杂项占满。
+- 长按面板翻页改成列"最像播放器的那个被调类"上其余带 speed 的方法，能直接看到 OwnPlayer 还有哪些入口。
+
+v7 的改动：倍率补齐成红果自己菜单里的全部档位（0.75 / 1.0 / 1.25 / 1.5 / 2.0 / 3.0），顺序 1 → 1.25 → 1.5 → 2 → 3 → 0.75 → 1。0 号位仍是 1.0，也就是"插件不干预"那一档，语义没变。
 
 **还没验证的部分（这台 Windows 无法验证，必须真机才清楚）**：
-- 没有 iOS 编译环境，这个 dylib 还没被编译器碰过，源码可能有语法/链接错。第一步是 Actions 能不能编绿。
-- `TTVideoEngine` 在运行时是否真的用这个名字（有没有被混淆/是子类），只有长按面板能告出来。
-  症状区分：**长按面板 `hook 0`** = 挂点名字不对，把截图发我改；**`hook ≥1`、`实例` 在播放后仍是 0** = 类对但走的是另一条setter；**有实例但不变速** = 红果自己按 `defaultPlaySpeed` 字符串又覆盖了一次，需要再挂 `setDefaultPlaySpeed:`。
+- v6/v7 只证明了能编译能链接，**没在真机跑过一次**。
+- 复测步骤：删掉巨魔里的旧注入 → 导入新的 `hongguospeed.dylib` → 打开红果播一集 → 点圆钮到 1.5 或 2 → 看画面是否真的变快。
+  - **真的变快**：再长按一次，确认 `TTVideoEngineOwnPlayer.setPlayerPlaybackSpeed: 调X 推Y` 的 `推` 不再是 0，然后 0.75 / 3.0 这些档位一起用。
+  - **没变但 `推` 有数字**：说明写进去了、红果没听 —— 长按截图发我，重点看那行的 `收<类名>`：显示 `收NSNumber` 就是数值通道对不上，显示别的类名说明它收的是配置对象，得换成构造那个对象来写。
+  - **`推` 仍是 0**：说明 OwnPlayer 的 setter 被跳过了（多半收的是非数字对象、或返回值不是 void）。那就转去"点红果自己的倍速菜单"这条路（UI 层触发，App 的显示和实际倍速还能一致），工作量和风险都会上一个台阶，动手前会先跟你确认。
 - 红果自带倍速菜单的数字可能和实际倍率对不上（插件在播放器层，App 自己不知道）。
 - 倍速后服务端统计的观看时长与实际播放可能不一致，涉及金币/提现收益，先小额试。
 

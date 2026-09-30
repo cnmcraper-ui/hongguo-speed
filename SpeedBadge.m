@@ -26,9 +26,11 @@
 //     ③ 只往播放倍速上写（方法名含 play 或接收者是播放器类），不再污染 setNetSpeed: 这类网速接口；
 //     ④ play/start 不再挂到 NSOperation 这类通用祖先类上（实测调 736 次全是噪音）；
 //     ⑤ Track 只收名字像播放器的对象，40 个名额不被杂项占满；⑥ 面板翻页改成列"最像播放器那个类"的 speed 方法。
+// v7：倍率补齐成红果自己菜单里的全部档位 —— 0.75 / 1.0 / 1.25 / 1.5 / 2.0 / 3.0。
+//     顺序 1 → 1.25 → 1.5 → 2 → 3 → 0.75 → 1；0 号位仍是 1.0（"不干预"档），语义不变。
 
-static const float kRates[] = { 1.0f, 1.25f, 1.5f, 2.0f };
-static const int kRateCount = 4;
+static const float kRates[] = { 1.0f, 1.25f, 1.5f, 2.0f, 3.0f, 0.75f };
+static const int kRateCount = 6;
 static int gRateIndex = 0;
 
 enum { kKindDouble, kKindFloat, kKindIntPercent, kKindObject, kKindLogVoid, kKindTrack };
