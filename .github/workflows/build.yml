@@ -1,0 +1,35 @@
+name: build-dylib
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  dylib:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Theos
+        run: |
+          git clone --recursive https://github.com/theos/theos.git "$HOME/theos"
+          echo "THEOS=$HOME/theos" >> "$GITHUB_ENV"
+          echo "$HOME/theos/bin" >> "$GITHUB_PATH"
+
+      - name: Build
+        run: make FINALPACKAGE=1
+
+      - name: Collect dylib
+        run: |
+          mkdir -p out
+          f=$(find .theos -type f -name hongguospeed.dylib | grep -v /debug/ | head -n 1 || true)
+          [ -n "$f" ] || f=$(find .theos -type f -name hongguospeed.dylib | head -n 1 || true)
+          echo "found: $f"
+          cp "$f" out/hongguospeed.dylib
+          ls -l out
+          file out/hongguospeed.dylib
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hongguospeed-dylib
+          path: out/hongguospeed.dylib
