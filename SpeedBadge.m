@@ -18,6 +18,14 @@
 // v5：① 上限 96 → 1024，并单列"溢出"计数，被截断时面板会显示；② 挂点改为可重扫，晚加载的类也能补上；
 //     ③ 加两个"问路"探针：UIApplication sendAction:（记录每次点按钮打到哪个类的哪个方法）和
 //        名字含 speed 的通知（记录是谁用通知传倍速）。这样即使挂点仍没命中，也能直接看到红果的倍速入口叫什么。
+// v5 实测：`hook 445 | 实例 6 | 跳过 414 | 溢出 0` —— 真播放器现形：
+//          TTVideoEngineOwnPlayer.setPlayerPlaybackSpeed: 调17 推0、.setPlaybackSpeed: 调11 推0。
+//          调了但推不到，说明它没被登记成可写对象：对象参数型的 setter 不 Track，且它多半收的是 NSNumber。
+// v6：① 对象参数也登记调用者，且传进来是 NSNumber 时按倍速代写；② 每个挂点自己记住"最近调用者类 /
+//        最近数值 / 最近传入对象类"，不再用全局"最后一次写入"（会被每秒刷几十次的网速接口盖掉）；
+//     ③ 只往播放倍速上写（方法名含 play 或接收者是播放器类），不再污染 setNetSpeed: 这类网速接口；
+//     ④ play/start 不再挂到 NSOperation 这类通用祖先类上（实测调 736 次全是噪音）；
+//     ⑤ Track 只收名字像播放器的对象，40 个名额不被杂项占满；⑥ 面板翻页改成列"最像播放器那个类"的 speed 方法。
 
 static const float kRates[] = { 1.0f, 1.25f, 1.5f, 2.0f };
 static const int kRateCount = 4;
@@ -32,6 +40,10 @@ typedef struct {
     int kind;
     int hits;
     int pushes;
+    int numberArg;    // 对象参数实测是 NSNumber，可以按倍速代写
+    Class recv;       // 最近一次调用者对象的类
+    double val;       // 最近一次调用时的数值
+    Class arg;        // 对象参数时，最近一次传进来的对象的类
 } HGEntry;
 
 #define kMaxEntries 1024
@@ -52,35 +64,32 @@ static void EnsureBadge(void);
 static float CurRate(void) { return kRates[gRateIndex]; }
 static BOOL Forcing(void) { return gRateIndex != 0; }
 
+// 选择器名/类名都是 ASCII，忽略大小写找子串不必走 NSString，也不会像定长缓冲区那样截断长名字
+static BOOL ContainsIC(const char *hay, const char *lowerNeedle) {
+    for (; *hay; hay++) {
+        const char *h = hay, *n = lowerNeedle;
+        while (*n && *h) {
+            char c = (*h >= 'A' && *h <= 'Z') ? (char)(*h + 32) : *h;
+            if (c != *n) break;
+            h++; n++;
+        }
+        if (!*n) return YES;
+    }
+    return NO;
+}
+
+static BOOL Playerish(const char *name) {
+    return strstr(name, "Player") || strstr(name, "Engine") || strstr(name, "Speed");
+}
+
+// 只登记"名字像播放器"的对象：红果里每个 speed setter 的调用者都塞进来的话，40 个名额
+// 会被网速采样、DNS 探测这类杂项占满，真正的播放器反而挤不进来。
 #define kMaxTracked 40
 static void Track(id obj) {
+    Class cls = object_getClass(obj);
+    if (!Playerish(class_getName(cls))) return;
     @synchronized (gPlayers) {
         if (gPlayers.count < kMaxTracked) [gPlayers addObject:obj];
-    }
-}
-
-// 最后一次写入只存指针和数值，格式化推到面板里做：挂点扩到 512 之后，
-// 每调一次就 alloc 一个 NSString 会给播放线程添负担。
-static Class gLastCls = nil;
-static SEL gLastSel = NULL;
-static double gLastVal = 0;
-static Class gLastArgCls = nil;
-
-static void Note(id obj, SEL sel, double value) {
-    @synchronized (gPlayers) {
-        gLastCls = object_getClass(obj);
-        gLastSel = sel;
-        gLastVal = value;
-        gLastArgCls = nil;
-    }
-}
-
-static void NoteObject(id obj, SEL sel, id value) {
-    @synchronized (gPlayers) {
-        gLastCls = object_getClass(obj);
-        gLastSel = sel;
-        gLastVal = 0;
-        gLastArgCls = value ? object_getClass(value) : nil;
     }
 }
 
@@ -106,6 +115,9 @@ static HGEntry *Match(id obj, SEL sel) {
 static void Write(HGEntry *entry, id target, float rate) {
     SEL sel = entry->setter;
     switch (entry->kind) {
+        case kKindObject:
+            ((void (*)(id, SEL, id))entry->orig)(target, sel, @(rate));
+            break;
         case kKindFloat:
             ((void (*)(id, SEL, float))entry->orig)(target, sel, rate);
             break;
@@ -124,7 +136,8 @@ static void HK_set_double(id self, SEL _cmd, double value) {
     if (!entry) return;
     entry->hits++;
     if (Forcing() && fabs(value - 1.0) < 0.001) value = CurRate();
-    Note(self, _cmd, value);
+    entry->recv = object_getClass(self);
+    entry->val = value;
     Write(entry, self, (float)value);
 }
 
@@ -134,7 +147,8 @@ static void HK_set_float(id self, SEL _cmd, float value) {
     if (!entry) return;
     entry->hits++;
     if (Forcing() && fabsf(value - 1.0f) < 0.001f) value = CurRate();
-    Note(self, _cmd, value);
+    entry->recv = object_getClass(self);
+    entry->val = value;
     Write(entry, self, value);
 }
 
@@ -145,16 +159,24 @@ static void HK_set_intpercent(id self, SEL _cmd, int value) {
     entry->hits++;
     float rate = value / 100.0f;
     if (Forcing() && value == 100) rate = CurRate();
-    Note(self, _cmd, rate);
+    entry->recv = object_getClass(self);
+    entry->val = rate;
     Write(entry, self, rate);
 }
 
-// 对象参数：不猜内容，只记"谁调了它、传进来的是什么类的对象"
+// 对象参数：只有一种情况会代写 —— 红果自己传进来的就是 NSNumber，那倍速肯定是数字语义
 static void HK_set_object(id self, SEL _cmd, id value) {
+    Track(self);
     HGEntry *entry = Match(self, _cmd);
     if (!entry) return;
     entry->hits++;
-    NoteObject(self, _cmd, value);
+    entry->recv = object_getClass(self);
+    entry->arg = value ? object_getClass(value) : nil;
+    if ([value isKindOfClass:NSNumber.class]) {
+        entry->numberArg = 1;
+        entry->val = [value doubleValue];
+        if (Forcing() && fabs(entry->val - 1.0) < 0.001) value = @(CurRate());
+    }
     ((void (*)(id, SEL, id))entry->orig)(self, _cmd, value);
 }
 
@@ -189,6 +211,14 @@ static BOOL NumericKind(int kind) {
     return kind == kKindDouble || kind == kKindFloat || kind == kKindIntPercent;
 }
 
+// 只往"播放倍速"上写。红果里网速采样、端口探测这类接口也叫 setXxxSpeed:，
+// 往那些上面写倍速只会污染它的测速模型，所以要求方法名带 play、或接收者本身是播放器类。
+static BOOL Pushable(HGEntry *entry) {
+    if (!NumericKind(entry->kind) && !(entry->kind == kKindObject && entry->numberArg)) return NO;
+    return ContainsIC(sel_getName(entry->setter), "play")
+        || ContainsIC(class_getName(entry->cls), "player");
+}
+
 static void InstallEntry(Class cls, SEL sel, Method method, int kind) {
     for (int i = 0; i < gEntryCount; i++) {
         if (gEntries[i].cls == cls && gEntries[i].setter == sel) return;
@@ -209,14 +239,7 @@ static const char *kRateNames[] = {
 static const char *kPlayNames[] = { "play", "start", "playOrResume", "resumePlay" };
 
 static BOOL HasSpeedWord(const char *name) {
-    char buf[80];
-    int i = 0;
-    for (; name[i] && i < 79; i++) {
-        char c = name[i];
-        buf[i] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;
-    }
-    buf[i] = 0;
-    return strstr(buf, "speed") != NULL;
+    return ContainsIC(name, "speed");
 }
 
 static BOOL Interesting(SEL sel) {
@@ -279,7 +302,7 @@ static void ApplyAll(float rate) {
         BOOL playing = NO, checked = NO;
         for (Class c = object_getClass(target); c; c = class_getSuperclass(c)) {
             for (int i = 0; i < gEntryCount; i++) {
-                if (gEntries[i].cls != c || !NumericKind(gEntries[i].kind)) continue;
+                if (gEntries[i].cls != c || !Pushable(&gEntries[i])) continue;
                 if (RateLikeSetter(gEntries[i].setter)) {
                     if (!checked) { playing = LikelyPlaying(target); checked = YES; }
                     if (!playing) continue;
@@ -345,10 +368,6 @@ static void HookApp(void) {
     HookOne(center, @selector(postNotificationName:object:userInfo:), (IMP)HK_post3, &gOrigPost3);
 }
 
-static BOOL Playerish(const char *name) {
-    return strstr(name, "Player") || strstr(name, "Engine") || strstr(name, "Speed");
-}
-
 // 红果的播放器类可能比浮钮更晚加载（懒加载的 framework），所以这个函数可以反复调用：
 // gVisited 记着扫过哪个类，重扫只会处理新出现的类。
 static void Discover(void) {
@@ -373,6 +392,9 @@ static void Discover(void) {
                 SEL sel = method_getName(methods[j]);
                 if (!Interesting(sel)) continue;
                 int kind = KindFor(methods[j]);
+                // play/start 只在名字就像播放器的类上挂。沿继承链挂到 NSOperation.start 会把全 App
+                // 的后台任务都登记成"播放器实例"（实测调 736 次），噪音盖住真目标。
+                if (kind == kKindTrack && !Playerish(class_getName(c))) kind = -1;
                 if (kind >= 0) InstallEntry(c, sel, methods[j], kind);
                 else gSkipped++;
             }
@@ -383,9 +405,9 @@ static void Discover(void) {
     HookApp();
 }
 
-static NSArray<NSString *> *SpeedSelectorsOf(id obj) {
+static NSArray<NSString *> *SpeedSelectorsOf(Class start) {
     NSMutableArray *out = [NSMutableArray array];
-    for (Class c = object_getClass(obj); c; c = class_getSuperclass(c)) {
+    for (Class c = start; c; c = class_getSuperclass(c)) {
         unsigned int n = 0;
         Method *methods = class_copyMethodList(c, &n);
         for (unsigned int j = 0; j < n && out.count < 40; j++) {
@@ -475,18 +497,11 @@ static NSArray<NSString *> *SpeedSelectorsOf(id obj) {
 
     Discover();
     NSArray *targets;
-    NSString *last = nil, *note = nil;
+    NSString *note = nil;
     Class noteObj = nil;
     int noteHits = 0, taps = 0, tapSeq = 0;
     @synchronized (gPlayers) {
         targets = gPlayers.allObjects;
-        if (gLastSel) {
-            last = gLastArgCls
-                ? [NSString stringWithFormat:@"写 %@ %@<- %@", NSStringFromClass(gLastCls),
-                                       NSStringFromSelector(gLastSel), NSStringFromClass(gLastArgCls)]
-                : [NSString stringWithFormat:@"写 %@ %@=%.3g", NSStringFromClass(gLastCls),
-                                       NSStringFromSelector(gLastSel), gLastVal];
-        }
         note = gNoteName; noteObj = gNoteObject; noteHits = gNoteHits;
         taps = gTapCount; tapSeq = gTapNext;
     }
@@ -494,7 +509,6 @@ static NSArray<NSString *> *SpeedSelectorsOf(id obj) {
     NSMutableArray *lines = [NSMutableArray array];
     [lines addObject:[NSString stringWithFormat:@"hook %d | 实例 %lu | 跳过 %d | 溢出 %d",
                                    gEntryCount, (unsigned long)targets.count, gSkipped, gDropped]];
-    [lines addObject:last ?: @"红果没走过任何被挂的方法"];
 
     int shown = taps < 3 ? taps : 3;
     for (int i = shown; i >= 1; i--) {
@@ -507,7 +521,7 @@ static NSArray<NSString *> *SpeedSelectorsOf(id obj) {
         [lines addObject:[NSString stringWithFormat:@"通知 %@ ×%d %@", note, noteHits,
                                        noteObj ? NSStringFromClass(noteObj) : @"(无对象)"]];
     }
-    for (NSUInteger i = 0; i < targets.count && i < 2; i++) {
+    for (NSUInteger i = 0; i < targets.count && i < 4; i++) {
         [lines addObject:[NSString stringWithFormat:@"实例%lu %@",
                                        (unsigned long)(i + 1), NSStringFromClass(object_getClass(targets[i]))]];
     }
@@ -520,16 +534,31 @@ static NSArray<NSString *> *SpeedSelectorsOf(id obj) {
         while (j > 0 && gEntries[order[j - 1]].hits < gEntries[i].hits) { order[j] = order[j - 1]; j--; }
         order[j] = i;
     }
-    for (int i = 0; i < n && i < 6; i++) {
+    for (int i = 0; i < n && i < 8; i++) {
         HGEntry *e = &gEntries[order[i]];
-        [lines addObject:[NSString stringWithFormat:@"%@.%@ 调%d 推%d",
+        NSMutableString *s = [NSMutableString stringWithFormat:@"%@.%@ 调%d 推%d",
                                        NSStringFromClass(e->cls), NSStringFromSelector(e->setter),
-                                       e->hits, e->pushes]];
+                                       e->hits, e->pushes];
+        if (e->recv && e->recv != e->cls) [s appendFormat:@" 于%@", NSStringFromClass(e->recv)];
+        if (e->kind == kKindObject) {
+            if (e->arg) [s appendFormat:@" 收%@", NSStringFromClass(e->arg)];
+        } else if (e->val != 0) {
+            [s appendFormat:@" =%.3g", e->val];
+        }
+        [lines addObject:s];
     }
     if (n == 0) [lines addObject:@"没有任何挂点被调用或推送过"];
 
-    if (targets.count) {
-        NSArray<NSString *> *sels = SpeedSelectorsOf(targets[0]);
+    // 翻页看"最像播放器的那个被调类"上还有哪些带 speed 的方法（这才是下一版要挂的目标）
+    Class probe = Nil;
+    for (int i = 0; i < n && !probe; i++) {
+        Class r = gEntries[order[i]].recv ?: gEntries[order[i]].cls;
+        if (ContainsIC(class_getName(r), "player")) probe = r;
+    }
+    if (!probe && n) probe = gEntries[order[0]].recv ?: gEntries[order[0]].cls;
+    if (!probe && targets.count) probe = object_getClass(targets[0]);
+    if (probe) {
+        NSArray<NSString *> *sels = SpeedSelectorsOf(probe);
         NSUInteger start = (_scanPage * 4) % (sels.count + 1);
         for (NSUInteger i = start; i < sels.count && i < start + 4; i++) {
             [lines addObject:[NSString stringWithFormat:@"· %@", sels[i]]];
