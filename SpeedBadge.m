@@ -76,6 +76,11 @@ static void Write(HGEntry *entry, id target, float rate) {
     }
 }
 
+// 只有 setRate: / setSpeed: 这类"写下去就会真的推动播放"的接口，才需要确认它在播
+static BOOL RateLikeSetter(SEL sel) {
+    return sel == sel_registerName("setRate:") || sel == sel_registerName("setSpeed:");
+}
+
 // 只有"现在真的在播"的对象才推倍率，避免点到按钮把后台停着的播放器（广告、听书）拽起来
 static BOOL LikelyPlaying(id target) {
     SEL rateSel = sel_registerName("rate");
@@ -93,10 +98,14 @@ static void ApplyAll(float rate) {
     NSArray *targets;
     @synchronized (gPlayers) { targets = gPlayers.allObjects; }
     for (id target in targets) {
-        if (!LikelyPlaying(target)) continue;
+        BOOL playing = NO, checked = NO;
         for (Class c = object_getClass(target); c; c = class_getSuperclass(c)) {
             for (int i = 0; i < gEntryCount; i++) {
                 if (gEntries[i].cls != c || gEntries[i].kind == kKindTrack) continue;
+                if (RateLikeSetter(gEntries[i].setter)) {
+                    if (!checked) { playing = LikelyPlaying(target); checked = YES; }
+                    if (!playing) continue;
+                }
                 Write(&gEntries[i], target, rate);
             }
         }
@@ -191,15 +200,15 @@ static void Discover(void) {
     for (int k = 0; k < 5; k++) gSpeedSels[k] = sel_registerName(kSpeedSetters[k]);
     for (int k = 0; k < 4; k++) gTrackSels[k] = sel_registerName(kTrackSetters[k]);
 
-    // 同一个祖先类（NSObject 等）只扫一次；链上遇到扫过的类就直接停
-    NSMutableSet<NSString *> *visited = [NSMutableSet set];
+    // 同一个祖先类只扫一次；链上遇到扫过的类就直接停。用类指针做 key，重名类不会被误跳过
+    NSMutableSet *visited = [NSMutableSet set];
     unsigned int count = 0;
     Class *classes = objc_copyClassList(&count);
     for (unsigned int i = 0; i < count; i++) {
         if (!Playerish(NSStringFromClass(classes[i]))) continue;
 
         for (Class c = classes[i]; c; c = class_getSuperclass(c)) {
-            NSString *owner = NSStringFromClass(c);
+            NSValue *owner = [NSValue valueWithPointer:(__bridge void *)c];
             if ([visited containsObject:owner]) break;
             [visited addObject:owner];
 
