@@ -316,15 +316,20 @@ static BOOL HK_sendAction(id self, SEL _cmd, SEL action, id target, id sender, U
     return ((BOOL (*)(id, SEL, SEL, id, id, UIEvent *))gOrigSendAction)(self, _cmd, action, target, sender, event);
 }
 
+// 通知是全 App 都在刷的热路径，这里只用 rangeOfString 判断、不转 UTF-8，避免每次 post 都产生临时字符串
+static BOOL SpeedNamed(NSString *name) {
+    return name && [name rangeOfString:@"peed"].location != NSNotFound;
+}
+
 static void HK_post2(id self, SEL _cmd, NSString *name, id object) {
-    if (name && HasSpeedWord(name.UTF8String)) {
+    if (SpeedNamed(name)) {
         @synchronized (gPlayers) { gNoteName = name; gNoteObject = object ? object_getClass(object) : nil; gNoteHits++; }
     }
     if (gOrigPost2) ((void (*)(id, SEL, NSString *, id))gOrigPost2)(self, _cmd, name, object);
 }
 
 static void HK_post3(id self, SEL _cmd, NSString *name, id object, NSDictionary *userInfo) {
-    if (name && HasSpeedWord(name.UTF8String)) {
+    if (SpeedNamed(name)) {
         @synchronized (gPlayers) { gNoteName = name; gNoteObject = object ? object_getClass(object) : nil; gNoteHits++; }
     }
     if (gOrigPost3) ((void (*)(id, SEL, NSString *, id, NSDictionary *))gOrigPost3)(self, _cmd, name, object, userInfo);
