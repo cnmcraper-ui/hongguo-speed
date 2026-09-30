@@ -17,15 +17,22 @@ jobs:
           echo "$HOME/theos/bin" >> "$GITHUB_PATH"
 
       - name: Build
-        run: make FINALPACKAGE=1
+        run: |
+          rc=0
+          make > build.log 2>&1 || rc=$?
+          if [ $rc -ne 0 ]; then
+            grep -E 'error:|fatal|No such file|not found|No rule|Stop\.' build.log \
+              | tail -n 10 \
+              | sed 's/%/%25/g' \
+              | while IFS= read -r l; do echo "::error::$l"; done
+            exit $rc
+          fi
+          tail -n 5 build.log
 
       - name: Collect dylib
         run: |
           mkdir -p out
-          f=$(find .theos -type f -name hongguospeed.dylib | grep -v /debug/ | head -n 1 || true)
-          [ -n "$f" ] || f=$(find .theos -type f -name hongguospeed.dylib | head -n 1 || true)
-          echo "found: $f"
-          cp "$f" out/hongguospeed.dylib
+          cp "$(find .theos -type f -name hongguospeed.dylib | head -n 1)" out/hongguospeed.dylib
           ls -l out
           file out/hongguospeed.dylib
 
