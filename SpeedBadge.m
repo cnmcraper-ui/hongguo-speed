@@ -163,6 +163,8 @@ static const char *kSpeedSetters[] = {
     "setPlaySpeed:", "updatePlaySpeed:", "setPlaySpeedWithRate:", "setRate:", "setSpeed:"
 };
 static const char *kTrackSetters[] = { "play", "start", "playOrResume", "resumePlay" };
+static SEL gSpeedSels[5];
+static SEL gTrackSels[4];
 
 // 参数必须是标量才敢按倍率写；对象/结构体参数一律跳过（计入"跳过 K"）
 static int ScalarKind(Method method) {
@@ -186,26 +188,35 @@ static void Discover(void) {
     if (gDiscovered) return;
     gDiscovered = YES;
 
+    for (int k = 0; k < 5; k++) gSpeedSels[k] = sel_registerName(kSpeedSetters[k]);
+    for (int k = 0; k < 4; k++) gTrackSels[k] = sel_registerName(kTrackSetters[k]);
+
+    // 同一个祖先类（NSObject 等）只扫一次；链上遇到扫过的类就直接停
+    NSMutableSet<NSString *> *visited = [NSMutableSet set];
     unsigned int count = 0;
     Class *classes = objc_copyClassList(&count);
     for (unsigned int i = 0; i < count; i++) {
         if (!Playerish(NSStringFromClass(classes[i]))) continue;
 
         for (Class c = classes[i]; c; c = class_getSuperclass(c)) {
+            NSString *owner = NSStringFromClass(c);
+            if ([visited containsObject:owner]) break;
+            [visited addObject:owner];
+
             unsigned int n = 0;
             Method *methods = class_copyMethodList(c, &n);
             for (unsigned int j = 0; j < n; j++) {
                 SEL sel = method_getName(methods[j]);
                 BOOL handled = NO;
                 for (int k = 0; k < 5 && !handled; k++) {
-                    if (sel != sel_registerName(kSpeedSetters[k])) continue;
+                    if (sel != gSpeedSels[k]) continue;
                     handled = YES;
                     int kind = ScalarKind(methods[j]);
                     if (kind >= 0) InstallEntry(c, sel, methods[j], kind);
                     else gSkipped++;
                 }
                 for (int k = 0; k < 4 && !handled; k++) {
-                    if (sel != sel_registerName(kTrackSetters[k])) continue;
+                    if (sel != gTrackSels[k]) continue;
                     handled = YES;
                     if (method_getNumberOfArguments(methods[j]) == 2) {
                         InstallEntry(c, sel, methods[j], kKindTrack);
