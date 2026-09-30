@@ -12,6 +12,12 @@
 // v4 改成广谱探针：凡名字含 speed 的方法、常见 rate setter、play/start 全部套上记录壳。
 //          数字参数的仍参与替换与推送；对象参数与 0 参数的只记调用、不改行为。
 //          长按面板直接点名"红果切倍速时到底调了哪个方法"。
+// v4 实测：面板 `hook 96 | 实例 2 | 跳过 414`，只有三个 .start 记到调用（TTVideoEngineBatteryMonitor /
+//          TTVideoEngineCFHostDNS / OHREngine），倍速相关的全是 0。而 96 正好等于 gEntries 数组上限
+//          → 挂点被静默截断，真正的 setter 很可能排在后面没挂上；认出来的"实例"也是名字带 Engine 的杂项类。
+// v5：① 上限 96 → 1024，并单列"溢出"计数，被截断时面板会显示；② 挂点改为可重扫，晚加载的类也能补上；
+//     ③ 加两个"问路"探针：UIApplication sendAction:（记录每次点按钮打到哪个类的哪个方法）和
+//        名字含 speed 的通知（记录是谁用通知传倍速）。这样即使挂点仍没命中，也能直接看到红果的倍速入口叫什么。
 
 static const float kRates[] = { 1.0f, 1.25f, 1.5f, 2.0f };
 static const int kRateCount = 4;
@@ -28,15 +34,17 @@ typedef struct {
     int pushes;
 } HGEntry;
 
-#define kMaxEntries 96
+#define kMaxEntries 1024
 static HGEntry gEntries[kMaxEntries];
 static int gEntryCount = 0;
 static int gSkipped = 0;
+static int gDropped = 0;
 static BOOL gDiscovered = NO;
+static CFAbsoluteTime gLastScan = 0;
+static NSMutableSet *gVisited = nil;
 static NSHashTable *gPlayers = nil;
 static UIView *gBadge = nil;
 static UILabel *gReport = nil;
-static NSString *gLastWrite = nil;
 
 static UIWindow *KeyWindow(void);
 static void EnsureBadge(void);
@@ -44,16 +52,47 @@ static void EnsureBadge(void);
 static float CurRate(void) { return kRates[gRateIndex]; }
 static BOOL Forcing(void) { return gRateIndex != 0; }
 
+#define kMaxTracked 40
 static void Track(id obj) {
-    @synchronized (gPlayers) { [gPlayers addObject:obj]; }
+    @synchronized (gPlayers) {
+        if (gPlayers.count < kMaxTracked) [gPlayers addObject:obj];
+    }
 }
 
+// 最后一次写入只存指针和数值，格式化推到面板里做：挂点扩到 512 之后，
+// 每调一次就 alloc 一个 NSString 会给播放线程添负担。
+static Class gLastCls = nil;
+static SEL gLastSel = NULL;
+static double gLastVal = 0;
+static Class gLastArgCls = nil;
+
 static void Note(id obj, SEL sel, double value) {
-    NSString *line = [NSString stringWithFormat:@"%@ %@=%.3g",
-                                  NSStringFromClass(object_getClass(obj)),
-                                  NSStringFromSelector(sel), value];
-    @synchronized (gPlayers) { gLastWrite = line; }
+    @synchronized (gPlayers) {
+        gLastCls = object_getClass(obj);
+        gLastSel = sel;
+        gLastVal = value;
+        gLastArgCls = nil;
+    }
 }
+
+static void NoteObject(id obj, SEL sel, id value) {
+    @synchronized (gPlayers) {
+        gLastCls = object_getClass(obj);
+        gLastSel = sel;
+        gLastVal = 0;
+        gLastArgCls = value ? object_getClass(value) : nil;
+    }
+}
+
+#define kMaxTaps 6
+static SEL gTapAction[kMaxTaps];
+static Class gTapTarget[kMaxTaps];
+static int gTapCount = 0;
+static int gTapNext = 0;
+
+static NSString *gNoteName = nil;
+static Class gNoteObject = nil;
+static int gNoteHits = 0;
 
 static HGEntry *Match(id obj, SEL sel) {
     for (Class c = object_getClass(obj); c; c = class_getSuperclass(c)) {
@@ -115,12 +154,7 @@ static void HK_set_object(id self, SEL _cmd, id value) {
     HGEntry *entry = Match(self, _cmd);
     if (!entry) return;
     entry->hits++;
-    @synchronized (gPlayers) {
-        gLastWrite = [NSString stringWithFormat:@"%@ %@<-%@",
-                                  NSStringFromClass(object_getClass(self)),
-                                  NSStringFromSelector(_cmd),
-                                  value ? NSStringFromClass(object_getClass(value)) : @"nil"];
-    }
+    NoteObject(self, _cmd, value);
     ((void (*)(id, SEL, id))entry->orig)(self, _cmd, value);
 }
 
@@ -156,10 +190,10 @@ static BOOL NumericKind(int kind) {
 }
 
 static void InstallEntry(Class cls, SEL sel, Method method, int kind) {
-    if (gEntryCount == kMaxEntries) return;
     for (int i = 0; i < gEntryCount; i++) {
         if (gEntries[i].cls == cls && gEntries[i].setter == sel) return;
     }
+    if (gEntryCount == kMaxEntries) { gDropped++; return; }
     gEntries[gEntryCount].cls = cls;
     gEntries[gEntryCount].setter = sel;
     gEntries[gEntryCount].orig = method_setImplementation(method, WrapperFor(kind));
@@ -257,26 +291,76 @@ static void ApplyAll(float rate) {
     }
 }
 
-static BOOL Playerish(NSString *name) {
-    return [name containsString:@"Player"] || [name containsString:@"Engine"] ||
-           [name containsString:@"Speed"];
+// —— 两个"问路"探针：万一倍速 setter 还是没命中，从"点了按钮打到哪个方法"和"谁发了带 speed 的通知"
+//    也能直接看到红果的倍速入口叫什么名字。只记录，不改行为。
+
+static IMP gOrigSendAction = NULL;
+static IMP gOrigPost2 = NULL;
+static IMP gOrigPost3 = NULL;
+
+static void HookOne(Class cls, SEL sel, IMP wrapper, IMP *saveOrig) {
+    Method m = class_getInstanceMethod(cls, sel);   // 含继承，拿到的是真正声明它的那个
+    if (!m) return;
+    *saveOrig = method_setImplementation(m, wrapper);
 }
 
-static void Discover(void) {
-    if (gDiscovered) return;
-    gDiscovered = YES;
+static BOOL HK_sendAction(id self, SEL _cmd, SEL action, id target, id sender, UIEvent *event) {
+    if (action && target) {
+        int slot = gTapNext % kMaxTaps;
+        gTapAction[slot] = action;
+        gTapTarget[slot] = object_getClass(target);
+        gTapNext++;
+        if (gTapCount < kMaxTaps) gTapCount++;
+    }
+    if (!gOrigSendAction) return NO;
+    return ((BOOL (*)(id, SEL, SEL, id, id, UIEvent *))gOrigSendAction)(self, _cmd, action, target, sender, event);
+}
 
-    // 同一个祖先类只扫一次；用类指针做 key，重名类不会被误跳过
-    NSMutableSet *visited = [NSMutableSet set];
+static void HK_post2(id self, SEL _cmd, NSString *name, id object) {
+    if (name && HasSpeedWord(name.UTF8String)) {
+        @synchronized (gPlayers) { gNoteName = name; gNoteObject = object ? object_getClass(object) : nil; gNoteHits++; }
+    }
+    if (gOrigPost2) ((void (*)(id, SEL, NSString *, id))gOrigPost2)(self, _cmd, name, object);
+}
+
+static void HK_post3(id self, SEL _cmd, NSString *name, id object, NSDictionary *userInfo) {
+    if (name && HasSpeedWord(name.UTF8String)) {
+        @synchronized (gPlayers) { gNoteName = name; gNoteObject = object ? object_getClass(object) : nil; gNoteHits++; }
+    }
+    if (gOrigPost3) ((void (*)(id, SEL, NSString *, id, NSDictionary *))gOrigPost3)(self, _cmd, name, object, userInfo);
+}
+
+static void HookApp(void) {
+    static BOOL done = NO;
+    if (done) return;
+    done = YES;
+    HookOne(UIApplication.class, @selector(sendAction:to:from:forEvent:), (IMP)HK_sendAction, &gOrigSendAction);
+    Class center = object_getClass(NSNotificationCenter.defaultCenter);
+    HookOne(center, @selector(postNotificationName:object:), (IMP)HK_post2, &gOrigPost2);
+    HookOne(center, @selector(postNotificationName:object:userInfo:), (IMP)HK_post3, &gOrigPost3);
+}
+
+static BOOL Playerish(const char *name) {
+    return strstr(name, "Player") || strstr(name, "Engine") || strstr(name, "Speed");
+}
+
+// 红果的播放器类可能比浮钮更晚加载（懒加载的 framework），所以这个函数可以反复调用：
+// gVisited 记着扫过哪个类，重扫只会处理新出现的类。
+static void Discover(void) {
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    if (gDiscovered && now - gLastScan < 2.0) return;
+    gDiscovered = YES;
+    gLastScan = now;
+
     unsigned int count = 0;
     Class *classes = objc_copyClassList(&count);
     for (unsigned int i = 0; i < count; i++) {
-        if (!Playerish(NSStringFromClass(classes[i]))) continue;
+        if (!Playerish(class_getName(classes[i]))) continue;
 
         for (Class c = classes[i]; c; c = class_getSuperclass(c)) {
             NSValue *owner = [NSValue valueWithPointer:(__bridge void *)c];
-            if ([visited containsObject:owner]) break;
-            [visited addObject:owner];
+            if ([gVisited containsObject:owner]) break;
+            [gVisited addObject:owner];
 
             unsigned int n = 0;
             Method *methods = class_copyMethodList(c, &n);
@@ -291,6 +375,7 @@ static void Discover(void) {
         }
     }
     free(classes);
+    HookApp();
 }
 
 static NSArray<NSString *> *SpeedSelectorsOf(id obj) {
@@ -379,19 +464,44 @@ static NSArray<NSString *> *SpeedSelectorsOf(id obj) {
     _dragged = NO;
 }
 
-// 长按：先报"红果真的调了什么"，再列这个实例上所有带 speed 的方法（再长按翻页）
+// 长按：报"红果真的调了什么"+"点了按钮打到哪"+"有没有走通知"，再翻页列实例上的 speed 方法
 - (void)showScan:(UILongPressGestureRecognizer *)gesture {
     if (gesture.state != UIGestureRecognizerStateBegan) return;
 
     Discover();
     NSArray *targets;
-    NSString *last;
-    @synchronized (gPlayers) { targets = gPlayers.allObjects; last = gLastWrite; }
+    NSString *last = nil, *note = nil;
+    Class noteObj = nil;
+    int noteHits = 0, taps = 0, tapSeq = 0;
+    @synchronized (gPlayers) {
+        targets = gPlayers.allObjects;
+        if (gLastSel) {
+            last = gLastArgCls
+                ? [NSString stringWithFormat:@"写 %@ %@<- %@", NSStringFromClass(gLastCls),
+                                       NSStringFromSelector(gLastSel), NSStringFromClass(gLastArgCls)]
+                : [NSString stringWithFormat:@"写 %@ %@=%.3g", NSStringFromClass(gLastCls),
+                                       NSStringFromSelector(gLastSel), gLastVal];
+        }
+        note = gNoteName; noteObj = gNoteObject; noteHits = gNoteHits;
+        taps = gTapCount; tapSeq = gTapNext;
+    }
 
     NSMutableArray *lines = [NSMutableArray array];
-    [lines addObject:[NSString stringWithFormat:@"hook %d | 实例 %lu | 跳过 %d",
-                                   gEntryCount, (unsigned long)targets.count, gSkipped]];
+    [lines addObject:[NSString stringWithFormat:@"hook %d | 实例 %lu | 跳过 %d | 溢出 %d",
+                                   gEntryCount, (unsigned long)targets.count, gSkipped, gDropped]];
     [lines addObject:last ?: @"红果没走过任何被挂的方法"];
+
+    int shown = taps < 3 ? taps : 3;
+    for (int i = shown; i >= 1; i--) {
+        int slot = (tapSeq - i) % kMaxTaps;
+        [lines addObject:[NSString stringWithFormat:@"按 %@ %@",
+                                       gTapTarget[slot] ? NSStringFromClass(gTapTarget[slot]) : @"?",
+                                       NSStringFromSelector(gTapAction[slot])]];
+    }
+    if (noteHits) {
+        [lines addObject:[NSString stringWithFormat:@"通知 %@ ×%d %@", note, noteHits,
+                                       noteObj ? NSStringFromClass(noteObj) : @"(无对象)"]];
+    }
     for (NSUInteger i = 0; i < targets.count && i < 2; i++) {
         [lines addObject:[NSString stringWithFormat:@"实例%lu %@",
                                        (unsigned long)(i + 1), NSStringFromClass(object_getClass(targets[i]))]];
@@ -405,7 +515,7 @@ static NSArray<NSString *> *SpeedSelectorsOf(id obj) {
         while (j > 0 && gEntries[order[j - 1]].hits < gEntries[i].hits) { order[j] = order[j - 1]; j--; }
         order[j] = i;
     }
-    for (int i = 0; i < n && i < 8; i++) {
+    for (int i = 0; i < n && i < 6; i++) {
         HGEntry *e = &gEntries[order[i]];
         [lines addObject:[NSString stringWithFormat:@"%@.%@ 调%d 推%d",
                                        NSStringFromClass(e->cls), NSStringFromSelector(e->setter),
@@ -415,18 +525,18 @@ static NSArray<NSString *> *SpeedSelectorsOf(id obj) {
 
     if (targets.count) {
         NSArray<NSString *> *sels = SpeedSelectorsOf(targets[0]);
-        NSUInteger start = (_scanPage * 5) % (sels.count + 1);
-        for (NSUInteger i = start; i < sels.count && i < start + 5; i++) {
+        NSUInteger start = (_scanPage * 4) % (sels.count + 1);
+        for (NSUInteger i = start; i < sels.count && i < start + 4; i++) {
             [lines addObject:[NSString stringWithFormat:@"· %@", sels[i]]];
         }
         _scanPage++;
     }
 
     if (!gReport) {
-        gReport = [[UILabel alloc] initWithFrame:CGRectMake(12, 60, 300, 320)];
+        gReport = [[UILabel alloc] initWithFrame:CGRectMake(10, 80, 340, 470)];
         gReport.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.85];
         gReport.textColor = [UIColor whiteColor];
-        gReport.font = [UIFont systemFontOfSize:10.0];
+        gReport.font = [UIFont systemFontOfSize:9.0];
         gReport.numberOfLines = 0;
         gReport.layer.cornerRadius = 8.0;
     }
@@ -467,6 +577,7 @@ static void EnsureBadge(void) {
 
 __attribute__((constructor)) static void HGSpeedInit(void) {
     gPlayers = [NSHashTable weakObjectsHashTable];
+    gVisited = [NSMutableSet set];
 
     // 挂点延迟到浮钮第一次出现时才装（那时 App 的播放器类已经全部加载完）
     CFRunLoopTimerRef timer = CFRunLoopTimerCreateWithHandler(NULL,
