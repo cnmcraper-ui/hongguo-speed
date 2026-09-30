@@ -6,25 +6,29 @@
 #import <stdlib.h>
 
 // 红果短剧 com.phoenix.video。
-// v2 真机长按面板实测：TTVideoEngine 在运行时并不响应 setPlaySpeed:（脱壳符号表里的类归属看错了），
-// 真正带倍速 setter 的是 SSPlayer(updatePlaySpeed:)、BDSCPlayer / BDSCAirPlayPlayer / BDLinkPlayer /
-// BDLEPlayer / BDDInaPlayer / BDByteCastPlayer / BDAirDisplayPlayer / TTVideoEngineEventBase(setPlaySpeed:)。
-// 所以本版不写死类名：运行时扫描"名字像播放器的类 + 其继承链"，在真正声明该 setter 的那个类上换 IMP。
+// v2 实测：写死 TTVideoEngine → hook 0（脱壳符号表里的类归属看错了）。
+// v3 实测：按名字扫出 32 个倍速 setter、登记到 2 个播放器实例，但用红果自己的倍速菜单切到 2.0x 时
+//          这 32 个挂点一次都没被调用 → 真正的倍速通道不在"我挑的这批 setter"里。
+// v4 改成广谱探针：凡名字含 speed 的方法、常见 rate setter、play/start 全部套上记录壳。
+//          数字参数的仍参与替换与推送；对象参数与 0 参数的只记调用、不改行为。
+//          长按面板直接点名"红果切倍速时到底调了哪个方法"。
 
 static const float kRates[] = { 1.0f, 1.25f, 1.5f, 2.0f };
 static const int kRateCount = 4;
 static int gRateIndex = 0;
 
-enum { kKindDouble, kKindFloat, kKindIntPercent, kKindTrack };
+enum { kKindDouble, kKindFloat, kKindIntPercent, kKindObject, kKindLogVoid, kKindTrack };
 
 typedef struct {
     Class cls;
     SEL setter;
     IMP orig;
     int kind;
+    int hits;
+    int pushes;
 } HGEntry;
 
-#define kMaxEntries 32
+#define kMaxEntries 96
 static HGEntry gEntries[kMaxEntries];
 static int gEntryCount = 0;
 static int gSkipped = 0;
@@ -33,7 +37,6 @@ static NSHashTable *gPlayers = nil;
 static UIView *gBadge = nil;
 static UILabel *gReport = nil;
 static NSString *gLastWrite = nil;
-static NSArray<NSString *> *gScanResult = nil;
 
 static UIWindow *KeyWindow(void);
 static void EnsureBadge(void);
@@ -76,12 +79,153 @@ static void Write(HGEntry *entry, id target, float rate) {
     }
 }
 
-// 只有 setRate: / setSpeed: 这类"写下去就会真的推动播放"的接口，才需要确认它在播
+static void HK_set_double(id self, SEL _cmd, double value) {
+    Track(self);
+    HGEntry *entry = Match(self, _cmd);
+    if (!entry) return;
+    entry->hits++;
+    if (Forcing() && fabs(value - 1.0) < 0.001) value = CurRate();
+    Note(self, _cmd, value);
+    Write(entry, self, (float)value);
+}
+
+static void HK_set_float(id self, SEL _cmd, float value) {
+    Track(self);
+    HGEntry *entry = Match(self, _cmd);
+    if (!entry) return;
+    entry->hits++;
+    if (Forcing() && fabsf(value - 1.0f) < 0.001f) value = CurRate();
+    Note(self, _cmd, value);
+    Write(entry, self, value);
+}
+
+static void HK_set_intpercent(id self, SEL _cmd, int value) {
+    Track(self);
+    HGEntry *entry = Match(self, _cmd);
+    if (!entry) return;
+    entry->hits++;
+    float rate = value / 100.0f;
+    if (Forcing() && value == 100) rate = CurRate();
+    Note(self, _cmd, rate);
+    Write(entry, self, rate);
+}
+
+// 对象参数：不猜内容，只记"谁调了它、传进来的是什么类的对象"
+static void HK_set_object(id self, SEL _cmd, id value) {
+    HGEntry *entry = Match(self, _cmd);
+    if (!entry) return;
+    entry->hits++;
+    @synchronized (gPlayers) {
+        gLastWrite = [NSString stringWithFormat:@"%@ %@<-%@",
+                                  NSStringFromClass(object_getClass(self)),
+                                  NSStringFromSelector(_cmd),
+                                  value ? NSStringFromClass(object_getClass(value)) : @"nil"];
+    }
+    ((void (*)(id, SEL, id))entry->orig)(self, _cmd, value);
+}
+
+static void HK_logvoid(id self, SEL _cmd) {
+    HGEntry *entry = Match(self, _cmd);
+    if (!entry) return;
+    entry->hits++;
+    ((void (*)(id, SEL))entry->orig)(self, _cmd);
+}
+
+// play / start 这类：只登记实例，行为原样
+static void HK_track(id self, SEL _cmd) {
+    Track(self);
+    HGEntry *entry = Match(self, _cmd);
+    if (!entry) return;
+    entry->hits++;
+    ((void (*)(id, SEL))entry->orig)(self, _cmd);
+}
+
+static IMP WrapperFor(int kind) {
+    switch (kind) {
+        case kKindFloat: return (IMP)HK_set_float;
+        case kKindIntPercent: return (IMP)HK_set_intpercent;
+        case kKindObject: return (IMP)HK_set_object;
+        case kKindLogVoid: return (IMP)HK_logvoid;
+        case kKindTrack: return (IMP)HK_track;
+        default: return (IMP)HK_set_double;
+    }
+}
+
+static BOOL NumericKind(int kind) {
+    return kind == kKindDouble || kind == kKindFloat || kind == kKindIntPercent;
+}
+
+static void InstallEntry(Class cls, SEL sel, Method method, int kind) {
+    if (gEntryCount == kMaxEntries) return;
+    for (int i = 0; i < gEntryCount; i++) {
+        if (gEntries[i].cls == cls && gEntries[i].setter == sel) return;
+    }
+    gEntries[gEntryCount].cls = cls;
+    gEntries[gEntryCount].setter = sel;
+    gEntries[gEntryCount].orig = method_setImplementation(method, WrapperFor(kind));
+    gEntries[gEntryCount].kind = kind;
+    gEntries[gEntryCount].hits = 0;
+    gEntries[gEntryCount].pushes = 0;
+    gEntryCount++;
+}
+
+static const char *kRateNames[] = {
+    "setRate:", "setPlaybackRate:", "setPlayRate:", "setTimeRate:", "updateRate:", "setRateValue:"
+};
+static const char *kPlayNames[] = { "play", "start", "playOrResume", "resumePlay" };
+
+static BOOL HasSpeedWord(const char *name) {
+    char buf[80];
+    int i = 0;
+    for (; name[i] && i < 79; i++) {
+        char c = name[i];
+        buf[i] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;
+    }
+    buf[i] = 0;
+    return strstr(buf, "speed") != NULL;
+}
+
+static BOOL Interesting(SEL sel) {
+    const char *n = sel_getName(sel);
+    if (HasSpeedWord(n)) return YES;
+    for (int k = 0; k < 6; k++) if (strcmp(n, kRateNames[k]) == 0) return YES;
+    for (int k = 0; k < 4; k++) if (strcmp(n, kPlayNames[k]) == 0) return YES;
+    return NO;
+}
+
+// 只挂返回 void 的：把返回 double 的 getter 换成 void 壳，调用方会读到垃圾值
+static BOOL ReturnsVoid(Method method) {
+    char *type = method_copyReturnType(method);
+    BOOL yes = type && type[0] == 'v';
+    free(type);
+    return yes;
+}
+
+static int KindFor(Method method) {
+    if (!ReturnsVoid(method)) return -1;
+    unsigned int args = method_getNumberOfArguments(method);
+    if (args == 2) {
+        const char *n = sel_getName(method_getName(method));
+        for (int k = 0; k < 4; k++) if (strcmp(n, kPlayNames[k]) == 0) return kKindTrack;
+        return kKindLogVoid;
+    }
+    if (args != 3) return -1;
+    char *type = method_copyArgumentType(method, 2);
+    if (!type) return -1;
+    char head = type[0];
+    free(type);
+    if (head == 'd') return kKindDouble;
+    if (head == 'f') return kKindFloat;
+    if (head == 'i' || head == 'q') return kKindIntPercent;
+    if (head == '@' || head == '#') return kKindObject;
+    return -1;
+}
+
+// 只有 setRate: / setSpeed: 这类"写下去会真的推动播放"的接口，才需要确认它在播
 static BOOL RateLikeSetter(SEL sel) {
     return sel == sel_registerName("setRate:") || sel == sel_registerName("setSpeed:");
 }
 
-// 只有"现在真的在播"的对象才推倍率，避免点到按钮把后台停着的播放器（广告、听书）拽起来
 static BOOL LikelyPlaying(id target) {
     SEL rateSel = sel_registerName("rate");
     Method m = class_getInstanceMethod(object_getClass(target), rateSel);
@@ -101,91 +245,16 @@ static void ApplyAll(float rate) {
         BOOL playing = NO, checked = NO;
         for (Class c = object_getClass(target); c; c = class_getSuperclass(c)) {
             for (int i = 0; i < gEntryCount; i++) {
-                if (gEntries[i].cls != c || gEntries[i].kind == kKindTrack) continue;
+                if (gEntries[i].cls != c || !NumericKind(gEntries[i].kind)) continue;
                 if (RateLikeSetter(gEntries[i].setter)) {
                     if (!checked) { playing = LikelyPlaying(target); checked = YES; }
                     if (!playing) continue;
                 }
+                gEntries[i].pushes++;
                 Write(&gEntries[i], target, rate);
             }
         }
     }
-}
-
-static void HK_set_double(id self, SEL _cmd, double value) {
-    Track(self);
-    HGEntry *entry = Match(self, _cmd);
-    if (!entry) return;
-    if (Forcing() && fabs(value - 1.0) < 0.001) value = CurRate();
-    Note(self, _cmd, value);
-    Write(entry, self, (float)value);
-}
-
-static void HK_set_float(id self, SEL _cmd, float value) {
-    Track(self);
-    HGEntry *entry = Match(self, _cmd);
-    if (!entry) return;
-    if (Forcing() && fabsf(value - 1.0f) < 0.001f) value = CurRate();
-    Note(self, _cmd, value);
-    Write(entry, self, value);
-}
-
-static void HK_set_intpercent(id self, SEL _cmd, int value) {
-    Track(self);
-    HGEntry *entry = Match(self, _cmd);
-    if (!entry) return;
-    float rate = value / 100.0f;
-    if (Forcing() && value == 100) rate = CurRate();
-    Note(self, _cmd, rate);
-    Write(entry, self, rate);
-}
-
-// 生命周期钩子只负责"认出这个播放器实例"，不改动任何行为
-static void HK_track(id self, SEL _cmd) {
-    Track(self);
-    HGEntry *entry = Match(self, _cmd);
-    if (entry && entry->orig) ((void (*)(id, SEL))entry->orig)(self, _cmd);
-}
-
-static IMP WrapperFor(int kind) {
-    switch (kind) {
-        case kKindFloat: return (IMP)HK_set_float;
-        case kKindIntPercent: return (IMP)HK_set_intpercent;
-        case kKindTrack: return (IMP)HK_track;
-        default: return (IMP)HK_set_double;
-    }
-}
-
-static void InstallEntry(Class cls, SEL sel, Method method, int kind) {
-    if (gEntryCount == kMaxEntries) return;
-    for (int i = 0; i < gEntryCount; i++) {
-        if (gEntries[i].cls == cls && gEntries[i].setter == sel) return;
-    }
-    gEntries[gEntryCount].cls = cls;
-    gEntries[gEntryCount].setter = sel;
-    gEntries[gEntryCount].orig = method_setImplementation(method, WrapperFor(kind));
-    gEntries[gEntryCount].kind = kind;
-    gEntryCount++;
-}
-
-static const char *kSpeedSetters[] = {
-    "setPlaySpeed:", "updatePlaySpeed:", "setPlaySpeedWithRate:", "setRate:", "setSpeed:"
-};
-static const char *kTrackSetters[] = { "play", "start", "playOrResume", "resumePlay" };
-static SEL gSpeedSels[5];
-static SEL gTrackSels[4];
-
-// 参数必须是标量才敢按倍率写；对象/结构体参数一律跳过（计入"跳过 K"）
-static int ScalarKind(Method method) {
-    if (method_getNumberOfArguments(method) != 3) return -1;
-    char *type = method_copyArgumentType(method, 2);
-    if (!type) return -1;
-    char head = type[0];
-    free(type);
-    if (head == 'd') return kKindDouble;
-    if (head == 'f') return kKindFloat;
-    if (head == 'i' || head == 'q') return kKindIntPercent;
-    return -1;
 }
 
 static BOOL Playerish(NSString *name) {
@@ -197,10 +266,7 @@ static void Discover(void) {
     if (gDiscovered) return;
     gDiscovered = YES;
 
-    for (int k = 0; k < 5; k++) gSpeedSels[k] = sel_registerName(kSpeedSetters[k]);
-    for (int k = 0; k < 4; k++) gTrackSels[k] = sel_registerName(kTrackSetters[k]);
-
-    // 同一个祖先类只扫一次；链上遇到扫过的类就直接停。用类指针做 key，重名类不会被误跳过
+    // 同一个祖先类只扫一次；用类指针做 key，重名类不会被误跳过
     NSMutableSet *visited = [NSMutableSet set];
     unsigned int count = 0;
     Class *classes = objc_copyClassList(&count);
@@ -216,21 +282,10 @@ static void Discover(void) {
             Method *methods = class_copyMethodList(c, &n);
             for (unsigned int j = 0; j < n; j++) {
                 SEL sel = method_getName(methods[j]);
-                BOOL handled = NO;
-                for (int k = 0; k < 5 && !handled; k++) {
-                    if (sel != gSpeedSels[k]) continue;
-                    handled = YES;
-                    int kind = ScalarKind(methods[j]);
-                    if (kind >= 0) InstallEntry(c, sel, methods[j], kind);
-                    else gSkipped++;
-                }
-                for (int k = 0; k < 4 && !handled; k++) {
-                    if (sel != gTrackSels[k]) continue;
-                    handled = YES;
-                    if (method_getNumberOfArguments(methods[j]) == 2) {
-                        InstallEntry(c, sel, methods[j], kKindTrack);
-                    }
-                }
+                if (!Interesting(sel)) continue;
+                int kind = KindFor(methods[j]);
+                if (kind >= 0) InstallEntry(c, sel, methods[j], kind);
+                else gSkipped++;
             }
             free(methods);
         }
@@ -238,31 +293,18 @@ static void Discover(void) {
     free(classes);
 }
 
-static NSArray<NSString *> *ScanOnce(void) {
-    if (gScanResult) return gScanResult;
-
-    static const char *kWatched[] = {
-        "defaultPlaySpeed", "setDefaultPlaySpeed:", "setPlaySpeed:", "playSpeed",
-        "setPlaySpeedWithRate:", "updatePlaySpeed:", "playSpeedBtnAction", "mPlaySpeedArray"
-    };
-    NSMutableArray *lines = [NSMutableArray array];
-    unsigned int count = 0;
-    Class *classes = objc_copyClassList(&count);
-    for (unsigned int i = 0; i < count && lines.count < 24; i++) {
-        Class cls = classes[i];
-        if (!Playerish(NSStringFromClass(cls))) continue;
-        for (int k = 0; k < 8; k++) {
-            SEL sel = sel_registerName(kWatched[k]);
-            if (class_getInstanceMethod(cls, sel)) {
-                [lines addObject:[NSString stringWithFormat:@"%@ %@",
-                                            NSStringFromClass(cls), NSStringFromSelector(sel)]];
-                break;
-            }
+static NSArray<NSString *> *SpeedSelectorsOf(id obj) {
+    NSMutableArray *out = [NSMutableArray array];
+    for (Class c = object_getClass(obj); c; c = class_getSuperclass(c)) {
+        unsigned int n = 0;
+        Method *methods = class_copyMethodList(c, &n);
+        for (unsigned int j = 0; j < n && out.count < 40; j++) {
+            const char *name = sel_getName(method_getName(methods[j]));
+            if (HasSpeedWord(name)) [out addObject:[NSString stringWithUTF8String:name]];
         }
+        free(methods);
     }
-    free(classes);
-    gScanResult = lines;
-    return lines;
+    return out;
 }
 
 @interface HGSpeedBadge : UIView {
@@ -337,33 +379,51 @@ static NSArray<NSString *> *ScanOnce(void) {
     _dragged = NO;
 }
 
-// 长按：显示真机上实际挂到了什么，截图即可定下一步
+// 长按：先报"红果真的调了什么"，再列这个实例上所有带 speed 的方法（再长按翻页）
 - (void)showScan:(UILongPressGestureRecognizer *)gesture {
     if (gesture.state != UIGestureRecognizerStateBegan) return;
 
     Discover();
-    NSArray<NSString *> *found = ScanOnce();
+    NSArray *targets;
+    NSString *last;
+    @synchronized (gPlayers) { targets = gPlayers.allObjects; last = gLastWrite; }
+
     NSMutableArray *lines = [NSMutableArray array];
     [lines addObject:[NSString stringWithFormat:@"hook %d | 实例 %lu | 跳过 %d",
-                                   gEntryCount, (unsigned long)gPlayers.allObjects.count, gSkipped]];
-    NSString *last;
-    @synchronized (gPlayers) { last = gLastWrite; }
-    [lines addObject:last ?: @"还没拦到任何写入"];
+                                   gEntryCount, (unsigned long)targets.count, gSkipped]];
+    [lines addObject:last ?: @"红果没走过任何被挂的方法"];
+    for (NSUInteger i = 0; i < targets.count && i < 2; i++) {
+        [lines addObject:[NSString stringWithFormat:@"实例%lu %@",
+                                       (unsigned long)(i + 1), NSStringFromClass(object_getClass(targets[i]))]];
+    }
 
-    for (int i = 0; i < gEntryCount && lines.count < 8; i++) {
-        if (gEntries[i].kind == kKindTrack) continue;
-        [lines addObject:[NSString stringWithFormat:@"已挂 %@ %@",
-                                      NSStringFromClass(gEntries[i].cls),
-                                      NSStringFromSelector(gEntries[i].setter)]];
+    int order[kMaxEntries];
+    int n = 0;
+    for (int i = 0; i < gEntryCount; i++) {
+        if (gEntries[i].hits + gEntries[i].pushes == 0) continue;
+        int j = n++;
+        while (j > 0 && gEntries[order[j - 1]].hits < gEntries[i].hits) { order[j] = order[j - 1]; j--; }
+        order[j] = i;
     }
-    NSUInteger start = _scanPage % (found.count + 1);
-    for (NSUInteger i = start; i < found.count && lines.count < 14; i++) {
-        [lines addObject:found[i]];
+    for (int i = 0; i < n && i < 8; i++) {
+        HGEntry *e = &gEntries[order[i]];
+        [lines addObject:[NSString stringWithFormat:@"%@.%@ 调%d 推%d",
+                                       NSStringFromClass(e->cls), NSStringFromSelector(e->setter),
+                                       e->hits, e->pushes]];
     }
-    _scanPage++;
+    if (n == 0) [lines addObject:@"没有任何挂点被调用或推送过"];
+
+    if (targets.count) {
+        NSArray<NSString *> *sels = SpeedSelectorsOf(targets[0]);
+        NSUInteger start = (_scanPage * 5) % (sels.count + 1);
+        for (NSUInteger i = start; i < sels.count && i < start + 5; i++) {
+            [lines addObject:[NSString stringWithFormat:@"· %@", sels[i]]];
+        }
+        _scanPage++;
+    }
 
     if (!gReport) {
-        gReport = [[UILabel alloc] initWithFrame:CGRectMake(12, 70, 300, 260)];
+        gReport = [[UILabel alloc] initWithFrame:CGRectMake(12, 60, 300, 320)];
         gReport.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.85];
         gReport.textColor = [UIColor whiteColor];
         gReport.font = [UIFont systemFontOfSize:10.0];
