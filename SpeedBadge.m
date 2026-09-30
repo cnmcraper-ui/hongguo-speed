@@ -67,6 +67,7 @@ static void ApplyToTracked(float rate) {
     }
 }
 
+static UIWindow *KeyWindow(void);
 static void EnsureBadge(void);
 
 // 应用把速度写回 1.0（起播、切集、重置）时替换成按钮当前倍率
@@ -91,7 +92,7 @@ static void HK_set_intpercent(id self, SEL _cmd, int value) {
     HGEntry *entry = Match(self, _cmd, NO);
     if (!entry) return;
     if (Forcing() && value == 100) value = (int)lroundf(CurRate() * 100.0f);
-    Write(entry, self, (float)value);
+    Write(entry, self, (float)value / 100.0f);
 }
 
 static int KindForEncoding(const char *encoding) {
@@ -271,7 +272,7 @@ static NSArray<NSString *> *ScanOnce(void) {
         gReport.layer.cornerRadius = 8.0;
     }
     gReport.text = [lines componentsJoinedByString:@"\n"];
-    UIView *container = self.window ? : UIApplication.sharedApplication.keyWindow;
+    UIView *container = self.window ?: KeyWindow();
     if (container) {
         [container addSubview:gReport];
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(12 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
@@ -282,10 +283,20 @@ static NSArray<NSString *> *ScanOnce(void) {
 
 @end
 
+static UIWindow *KeyWindow(void) {
+    for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+        if (scene.activationState != UISceneActivationStateForegroundActive) continue;
+        if (![scene isKindOfClass:UIWindowScene.class]) continue;
+        for (UIWindow *window in ((UIWindowScene *)scene).windows) {
+            if (window.isKeyWindow) return window;
+        }
+    }
+    return UIApplication.sharedApplication.delegate.window;
+}
+
 static void EnsureBadge(void) {
     if (gBadge && gBadge.window) return;
-    UIWindow *window = UIApplication.sharedApplication.keyWindow;
-    if (!window) window = UIApplication.sharedApplication.windows.firstObject;
+    UIWindow *window = KeyWindow();
     if (!window) return;
 
     if (!gBadge) gBadge = [[HGSpeedBadge alloc] initWithFrame:CGRectMake(0, 0, 48, 48)];
