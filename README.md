@@ -15,11 +15,12 @@
 | **`hongguospeed.dylib`** | **已经编好的成品，直接把这个文件传到手机用就行** |
 | `push-to-github.bat` | 备用：以后改过源码、要重新触发云端编译时用 |
 
-## 一、成品已经有了（2026-09-30 第 10 次云端编译通过 = v5 探针版）
+## 一、成品已经有了（2026-09-30 第 12 次云端编译通过 = v7 全档位版）
 
-`hongguospeed.dylib` 就在这个目录里，98,320 字节（SHA256 `f7de872a…1b12`），已验证：
+`hongguospeed.dylib` 就在这个目录里，98,352 字节（SHA256 `9a8f9eff…7191`），已验证：
 - Mach-O `MH_DYLIB`、单架构 **arm64**（非 arm64e）、`cpusubtype=0`，和红果主程序架构一致；
 - 依赖 `/libobjc.A.dylib`、`Foundation`、`UIKit`、`AVFoundation`，没有 `CydiaSubstrate`、没有 `libJailedShim`；
+- 里面确实带着 v7 的六个档位常量（`1.0 1.25 1.5 2.0 3.0 0.75` 在 `__DATA` 里连成一张表），以及 v6 的探针字符串 —— 证明这不是旧版；
 - 运行时的实际表现见下面第四节，靠长按面板自证。
 
 **改过 `SpeedBadge.m` 之后才需要重新编译**：把改动后的 `SpeedBadge.m`（和 `.github/workflows/build.yml` 如果也改了）用 GitHub 网页 `Add file → Upload files` 传到
@@ -50,7 +51,7 @@
      `调X` = 红果自己调了几次，`推Y` = 插件往里写了几次；一条都没有时显示 `没有任何挂点被调用或推送过`。
   **再长按一次会翻页列"最像播放器的那个类"上其余带 speed 的方法。有问题就长按截图发我。**
 
-想要"一打开就默认 1.5"：把 `SpeedBadge.m` 里 `static int gRateIndex = 0;` 那一行改成 `= 2;`，重新走一遍编译。
+想要"一打开就默认某个倍率"：把 `SpeedBadge.m` 里 `static int gRateIndex = 0;` 那一行改成对应下标 —— `1`=1.25、`2`=1.5、`3`=2.0、`4`=3.0、`5`=0.75（`0` 是 1.0 不干预），重新走一遍编译。
 
 ## 四、已验证 / 未验证（务必看清）
 
