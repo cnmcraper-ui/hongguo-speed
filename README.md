@@ -15,12 +15,12 @@
 | **`hongguospeed.dylib`** | **已经编好的成品，直接把这个文件传到手机用就行** |
 | `push-to-github.bat` | 备用：以后改过源码、要重新触发云端编译时用 |
 
-## 一、成品已经有了（2026-09-30 第 12 次云端编译通过 = v7 全档位版）
+## 一、成品已经有了（2026-10-01 第 13 次云端编译通过 = v8 修黑屏 + 记忆档位）
 
-`hongguospeed.dylib` 就在这个目录里，98,352 字节（SHA256 `9a8f9eff…7191`），已验证：
+`hongguospeed.dylib` 就在这个目录里，99,344 字节（SHA256 `13b73159…d8688`），已验证：
 - Mach-O `MH_DYLIB`、单架构 **arm64**（非 arm64e）、`cpusubtype=0`，和红果主程序架构一致；
 - 依赖 `/libobjc.A.dylib`、`Foundation`、`UIKit`、`AVFoundation`，没有 `CydiaSubstrate`、没有 `libJailedShim`；
-- 里面确实带着 v7 的六个档位常量（`1.0 1.25 1.5 2.0 3.0 0.75` 在 `__DATA` 里连成一张表），以及 v6 的探针字符串 —— 证明这不是旧版；
+- 里面确实带着 v8 的新东西：存档位用的键 `HGSpeedRate`、面板新增的 `扫` 文案，以及 v7 那六个档位常量（`1.0 1.25 1.5 2.0 3.0 0.75` 在 `__DATA` 里连成一张表）—— 证明这不是旧版；
 - 运行时的实际表现见下面第四节，靠长按面板自证。
 
 **改过 `SpeedBadge.m` 之后才需要重新编译**：把改动后的 `SpeedBadge.m`（和 `.github/workflows/build.yml` 如果也改了）用 GitHub 网页 `Add file → Upload files` 传到
