@@ -35,6 +35,8 @@
 //     ② 档位存进 NSUserDefaults（键 HGSpeedRate），下次启动直接恢复；恢复后不用点圆钮 —— 一旦有播放器
 //        对象被登记出来，就自动补写一次当前倍率。
 //     ③ 顺带把挂点数组的发布顺序改成"先填内容、最后写 cls"，后台扫描与红果自己的调用并发时不会读到半条记录。
+// v9：圆钮位置也记住 —— 拖动结束存进 NSUserDefaults（键 HGBadgePos，存的是占屏幕宽高的比例，
+//     转屏/换机型不会跑到屏幕外），下次建钮直接回到那个位置。默认位置不变（右侧偏上）。
 
 static const float kRates[] = { 1.0f, 1.25f, 1.5f, 2.0f, 3.0f, 0.75f };
 static const int kRateCount = 6;
@@ -89,6 +91,32 @@ static void SaveRate(void) {
     NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
     [d setDouble:CurRate() forKey:@"HGSpeedRate"];
     [d synchronize];
+}
+
+// 圆钮能活动的范围：半径 + 8 的边距，顶部再让出 40（别盖住状态栏）
+static CGPoint ClampCenter(CGPoint p, CGSize screen) {
+    CGFloat edge = 48.0 * 0.5 + 8.0;
+    p.x = fmin(fmax(p.x, edge), screen.width - edge);
+    p.y = fmin(fmax(p.y, edge), screen.height - edge - 40.0);
+    return p;
+}
+
+// 位置存的是"占屏幕宽高的比例"，这样转屏、换机型都不会落到屏幕外面
+static void SavePosition(CGPoint center, CGSize screen) {
+    if (screen.width < 1.0 || screen.height < 1.0) return;
+    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+    [d setObject:@[@(center.x / screen.width), @(center.y / screen.height)] forKey:@"HGBadgePos"];
+    [d synchronize];
+}
+
+static CGPoint RestoredCenter(CGSize screen) {
+    NSArray *saved = [[NSUserDefaults standardUserDefaults] arrayForKey:@"HGBadgePos"];
+    if (saved.count == 2) {
+        CGPoint p = CGPointMake([saved[0] doubleValue] * screen.width,
+                                [saved[1] doubleValue] * screen.height);
+        if (p.x > 0 && p.y > 0) return ClampCenter(p, screen);
+    }
+    return CGPointMake(screen.width - 34.0, floor(screen.height * 0.40));
 }
 
 // 选择器名/类名都是 ASCII，忽略大小写找子串不必走 NSString，也不会像定长缓冲区那样截断长名字
@@ -516,14 +544,15 @@ static NSArray<NSString *> *SpeedSelectorsOf(Class start) {
     if (!_dragged && hypot(point.x - _startPoint.x, point.y - _startPoint.y) < 10.0) return;
     _dragged = YES;
 
-    CGFloat edge = self.frame.size.width * 0.5 + 8.0;
-    CGFloat x = fmin(fmax(point.x, edge), container.bounds.size.width - edge);
-    CGFloat y = fmin(fmax(point.y, edge), container.bounds.size.height - edge - 40.0);
-    self.center = CGPointMake(x, y);
+    self.center = ClampCenter(point, container.bounds.size);
 }
 
 - (void)touchesEnded:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
-    if (_dragged) return;
+    if (_dragged) {
+        UIView *container = self.superview;
+        if (container) SavePosition(self.center, container.bounds.size);
+        return;
+    }
     Discover();
     gRateIndex = (gRateIndex + 1) % kRateCount;
     [self refresh];
@@ -652,8 +681,7 @@ static void EnsureBadge(void) {
     if (!window) return;
 
     if (!gBadge) gBadge = [[HGSpeedBadge alloc] initWithFrame:CGRectMake(0, 0, 48, 48)];
-    CGSize size = window.bounds.size;
-    gBadge.center = CGPointMake(size.width - 34.0, floor(size.height * 0.40));
+    gBadge.center = RestoredCenter(window.bounds.size);
     [window addSubview:gBadge];
     Discover();
 }
