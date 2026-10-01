@@ -1,6 +1,7 @@
 #import <UIKit/UIKit.h>
 #import <AVFoundation/AVFoundation.h>
 #import <objc/runtime.h>
+#import <dispatch/dispatch.h>
 #import <math.h>
 #import <string.h>
 #import <stdlib.h>
@@ -28,6 +29,12 @@
 //     ⑤ Track 只收名字像播放器的对象，40 个名额不被杂项占满；⑥ 面板翻页改成列"最像播放器那个类"的 speed 方法。
 // v7：倍率补齐成红果自己菜单里的全部档位 —— 0.75 / 1.0 / 1.25 / 1.5 / 2.0 / 3.0。
 //     顺序 1 → 1.25 → 1.5 → 2 → 3 → 0.75 → 1；0 号位仍是 1.0（"不干预"档），语义不变。
+// v7 真机反馈两个问题：① 起播时"有声音但黑屏，过一会才出画面"；② 每次打开都回到 1.0，要记忆上次档位。
+// v8：① 黑屏的根因是那次全类扫描在主线程上跑（几万个类 + 每个方法 malloc 类型串），把主线程卡住 →
+//        首帧提交不了。扫描整个搬到后台队列，主线程只负责建浮钮；面板第一行加"扫 X ms"以便复核耗时。
+//     ② 档位存进 NSUserDefaults（键 HGSpeedRate），下次启动直接恢复；恢复后不用点圆钮 —— 一旦有播放器
+//        对象被登记出来，就自动补写一次当前倍率。
+//     ③ 顺带把挂点数组的发布顺序改成"先填内容、最后写 cls"，后台扫描与红果自己的调用并发时不会读到半条记录。
 
 static const float kRates[] = { 1.0f, 1.25f, 1.5f, 2.0f, 3.0f, 0.75f };
 static const int kRateCount = 6;
@@ -59,12 +66,30 @@ static NSMutableSet *gVisited = nil;
 static NSHashTable *gPlayers = nil;
 static UIView *gBadge = nil;
 static UILabel *gReport = nil;
+static volatile BOOL gFreshPlayer = NO;   // 有新播放器被登记出来 → 主线程补写一次当前倍率
+static volatile BOOL gScanning = NO;
+static volatile int gScanMs = 0;
 
 static UIWindow *KeyWindow(void);
 static void EnsureBadge(void);
 
 static float CurRate(void) { return kRates[gRateIndex]; }
 static BOOL Forcing(void) { return gRateIndex != 0; }
+
+// 上次的档位存在用户偏好里；认不出来（没存过、或那个档位以后被删了）就回到 1.0 不干预
+static void LoadRate(void) {
+    double saved = [[NSUserDefaults standardUserDefaults] doubleForKey:@"HGSpeedRate"];
+    gRateIndex = 0;
+    for (int i = 1; i < kRateCount; i++) {
+        if (fabs(kRates[i] - saved) < 0.001) { gRateIndex = i; return; }
+    }
+}
+
+static void SaveRate(void) {
+    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+    [d setDouble:CurRate() forKey:@"HGSpeedRate"];
+    [d synchronize];
+}
 
 // 选择器名/类名都是 ASCII，忽略大小写找子串不必走 NSString，也不会像定长缓冲区那样截断长名字
 static BOOL ContainsIC(const char *hay, const char *lowerNeedle) {
@@ -91,7 +116,10 @@ static void Track(id obj) {
     Class cls = object_getClass(obj);
     if (!Playerish(class_getName(cls))) return;
     @synchronized (gPlayers) {
-        if (gPlayers.count < kMaxTracked) [gPlayers addObject:obj];
+        NSUInteger before = gPlayers.count;
+        if (before < kMaxTracked) [gPlayers addObject:obj];
+        // 第一次见到这个对象：让主线程稍后把当前倍率补写上去（恢复记忆时不用用户再点一下）
+        if (gPlayers.count > before) gFreshPlayer = YES;
     }
 }
 
@@ -232,6 +260,9 @@ static void InstallEntry(Class cls, SEL sel, Method method, int kind) {
     gEntries[gEntryCount].kind = kind;
     gEntries[gEntryCount].hits = 0;
     gEntries[gEntryCount].pushes = 0;
+    // 扫描搬到后台线程后，这里必须保证"整条记录先落地、再让别的线程看见 gEntryCount"，
+    // 否则红果的调用可能读到一条 orig 还是空壳的记录。
+    __sync_synchronize();
     gEntryCount++;
 }
 
@@ -370,14 +401,10 @@ static void HookApp(void) {
     HookOne(center, @selector(postNotificationName:object:userInfo:), (IMP)HK_post3, &gOrigPost3);
 }
 
-// 红果的播放器类可能比浮钮更晚加载（懒加载的 framework），所以这个函数可以反复调用：
-// gVisited 记着扫过哪个类，重扫只会处理新出现的类。
-static void Discover(void) {
-    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
-    if (gDiscovered && now - gLastScan < 2.0) return;
-    gDiscovered = YES;
-    gLastScan = now;
-
+// 真正的扫描。几万个类、每个方法都要 malloc 一次类型串，**绝不能放在主线程上跑**
+// （v7 就是卡在这里：主线程一停，首帧提交不了 → 有声音但黑屏）。
+static void ScanAll(void) {
+    CFAbsoluteTime t0 = CFAbsoluteTimeGetCurrent();
     unsigned int count = 0;
     Class *classes = objc_copyClassList(&count);
     for (unsigned int i = 0; i < count; i++) {
@@ -405,6 +432,20 @@ static void Discover(void) {
     }
     free(classes);
     HookApp();
+    gScanMs = (int)((CFAbsoluteTimeGetCurrent() - t0) * 1000.0);
+    gScanning = NO;
+}
+
+// 红果的播放器类可能比浮钮更晚加载（懒加载的 framework），所以可以反复调用：
+// gVisited 记着扫过哪个类，重扫只会处理新出现的类。扫描本身丢到后台队列，主线程不等待。
+static void Discover(void) {
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    if (gDiscovered && now - gLastScan < 2.0) return;
+    gDiscovered = YES;
+    gLastScan = now;
+    if (gScanning) return;
+    gScanning = YES;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ ScanAll(); });
 }
 
 static NSArray<NSString *> *SpeedSelectorsOf(Class start) {
@@ -486,6 +527,7 @@ static NSArray<NSString *> *SpeedSelectorsOf(Class start) {
     Discover();
     gRateIndex = (gRateIndex + 1) % kRateCount;
     [self refresh];
+    SaveRate();
     ApplyAll(CurRate());
 }
 
@@ -509,8 +551,8 @@ static NSArray<NSString *> *SpeedSelectorsOf(Class start) {
     }
 
     NSMutableArray *lines = [NSMutableArray array];
-    [lines addObject:[NSString stringWithFormat:@"hook %d | 实例 %lu | 跳过 %d | 溢出 %d",
-                                   gEntryCount, (unsigned long)targets.count, gSkipped, gDropped]];
+    [lines addObject:[NSString stringWithFormat:@"hook %d | 实例 %lu | 跳过 %d | 溢出 %d | 扫 %d ms",
+                                   gEntryCount, (unsigned long)targets.count, gSkipped, gDropped, gScanMs]];
 
     int shown = taps < 3 ? taps : 3;
     for (int i = shown; i >= 1; i--) {
@@ -600,6 +642,11 @@ static UIWindow *KeyWindow(void) {
 }
 
 static void EnsureBadge(void) {
+    // 刚登记出一个新播放器（可能是恢复记忆后红果第一次起播）→ 把当前倍率补写上去
+    if (gFreshPlayer) {
+        gFreshPlayer = NO;
+        if (Forcing()) ApplyAll(CurRate());
+    }
     if (gBadge && gBadge.window) return;
     UIWindow *window = KeyWindow();
     if (!window) return;
@@ -614,6 +661,7 @@ static void EnsureBadge(void) {
 __attribute__((constructor)) static void HGSpeedInit(void) {
     gPlayers = [NSHashTable weakObjectsHashTable];
     gVisited = [NSMutableSet set];
+    LoadRate();
 
     // 挂点延迟到浮钮第一次出现时才装（那时 App 的播放器类已经全部加载完）
     CFRunLoopTimerRef timer = CFRunLoopTimerCreateWithHandler(NULL,
