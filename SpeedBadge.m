@@ -71,7 +71,6 @@ static UILabel *gReport = nil;
 static volatile BOOL gFreshPlayer = NO;   // 有新播放器被登记出来 → 主线程补写一次当前倍率
 static volatile BOOL gScanning = NO;
 static volatile int gScanMs = 0;
-static CFAbsoluteTime gRestoreUntil = 0;
 
 static UIWindow *KeyWindow(void);
 static void EnsureBadge(void);
@@ -558,7 +557,6 @@ static NSArray<NSString *> *SpeedSelectorsOf(Class start) {
     gRateIndex = (gRateIndex + 1) % kRateCount;
     [self refresh];
     SaveRate();
-    gRestoreUntil = CFAbsoluteTimeGetCurrent() + 8.0;
     ApplyAll(CurRate());
 }
 
@@ -674,27 +672,28 @@ static UIWindow *KeyWindow(void) {
 
 static void EnsureBadge(void) {
     Discover();
-    // 播放器可能晚于浮钮和首轮扫描出现；启动/切档后的短窗口内持续补写记忆倍率。
-    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
-    if (gFreshPlayer || (Forcing() && now < gRestoreUntil)) {
-        gFreshPlayer = NO;
-        if (Forcing()) ApplyAll(CurRate());
-    }
-    if (gBadge && gBadge.window) return;
     UIWindow *window = KeyWindow();
     if (!window) return;
 
+    // 首页和播放页可能各自创建窗口；浮钮必须跟着当前 key window 走。
     if (!gBadge) gBadge = [[HGSpeedBadge alloc] initWithFrame:CGRectMake(0, 0, 48, 48)];
-    gBadge.center = RestoredCenter(window.bounds.size);
-    [window addSubview:gBadge];
-    Discover();
+    if (gBadge.window != window) {
+        [gBadge removeFromSuperview];
+        gBadge.center = RestoredCenter(window.bounds.size);
+        [window addSubview:gBadge];
+    }
+
+    // 播放器可能晚于浮钮和首轮扫描出现；记忆倍率启用时持续补写已登记对象。
+    if (gFreshPlayer || Forcing()) {
+        gFreshPlayer = NO;
+        if (Forcing()) ApplyAll(CurRate());
+    }
 }
 
 __attribute__((constructor)) static void HGSpeedInit(void) {
     gPlayers = [NSHashTable weakObjectsHashTable];
     gVisited = [NSMutableSet set];
     LoadRate();
-    if (Forcing()) gRestoreUntil = CFAbsoluteTimeGetCurrent() + 8.0;
     Discover();
 
     CFRunLoopTimerRef timer = CFRunLoopTimerCreateWithHandler(NULL,
