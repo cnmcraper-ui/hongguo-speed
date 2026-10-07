@@ -71,6 +71,7 @@ static UILabel *gReport = nil;
 static volatile BOOL gFreshPlayer = NO;   // 有新播放器被登记出来 → 主线程补写一次当前倍率
 static volatile BOOL gScanning = NO;
 static volatile int gScanMs = 0;
+static CFAbsoluteTime gRestoreUntil = 0;
 
 static UIWindow *KeyWindow(void);
 static void EnsureBadge(void);
@@ -557,6 +558,7 @@ static NSArray<NSString *> *SpeedSelectorsOf(Class start) {
     gRateIndex = (gRateIndex + 1) % kRateCount;
     [self refresh];
     SaveRate();
+    gRestoreUntil = CFAbsoluteTimeGetCurrent() + 8.0;
     ApplyAll(CurRate());
 }
 
@@ -671,8 +673,10 @@ static UIWindow *KeyWindow(void) {
 }
 
 static void EnsureBadge(void) {
-    // 刚登记出一个新播放器（可能是恢复记忆后红果第一次起播）→ 把当前倍率补写上去
-    if (gFreshPlayer) {
+    Discover();
+    // 播放器可能晚于浮钮和首轮扫描出现；启动/切档后的短窗口内持续补写记忆倍率。
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    if (gFreshPlayer || (Forcing() && now < gRestoreUntil)) {
         gFreshPlayer = NO;
         if (Forcing()) ApplyAll(CurRate());
     }
@@ -690,9 +694,10 @@ __attribute__((constructor)) static void HGSpeedInit(void) {
     gPlayers = [NSHashTable weakObjectsHashTable];
     gVisited = [NSMutableSet set];
     LoadRate();
+    if (Forcing()) gRestoreUntil = CFAbsoluteTimeGetCurrent() + 8.0;
+    Discover();
 
-    // 挂点延迟到浮钮第一次出现时才装（那时 App 的播放器类已经全部加载完）
     CFRunLoopTimerRef timer = CFRunLoopTimerCreateWithHandler(NULL,
-        CFAbsoluteTimeGetCurrent() + 1.0, 0.5, 0, 0, ^(CFRunLoopTimerRef t) { EnsureBadge(); });
+        CFAbsoluteTimeGetCurrent() + 0.2, 0.5, 0, 0, ^(CFRunLoopTimerRef t) { EnsureBadge(); });
     CFRunLoopAddTimer(CFRunLoopGetCurrent(), timer, kCFRunLoopCommonModes);
 }
