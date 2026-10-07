@@ -509,6 +509,7 @@ static NSArray<NSString *> *SpeedSelectorsOf(Class start) {
         self.layer.cornerRadius = frame.size.width * 0.5;
         self.layer.borderWidth = 1.0;
         self.layer.borderColor = [[UIColor whiteColor] colorWithAlphaComponent:0.30].CGColor;
+        self.layer.zPosition = 9999.0f;
         self.alpha = 0.45;
 
         _label = [[UILabel alloc] initWithFrame:frame];
@@ -646,11 +647,14 @@ static NSArray<NSString *> *SpeedSelectorsOf(Class start) {
         gReport.font = [UIFont systemFontOfSize:9.0];
         gReport.numberOfLines = 0;
         gReport.layer.cornerRadius = 8.0;
+        gReport.layer.zPosition = 10000.0f;
     }
     gReport.text = [lines componentsJoinedByString:@"\n"];
     UIView *container = self.window ?: KeyWindow();
     if (container) {
+        gReport.layer.zPosition = 10000.0f;
         [container addSubview:gReport];
+        [container bringSubviewToFront:gReport];
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(12 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             [gReport removeFromSuperview];
         });
@@ -660,14 +664,22 @@ static NSArray<NSString *> *SpeedSelectorsOf(Class start) {
 @end
 
 static UIWindow *KeyWindow(void) {
+    UIWindow *candidate = nil;
     for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
         if (scene.activationState != UISceneActivationStateForegroundActive) continue;
         if (![scene isKindOfClass:UIWindowScene.class]) continue;
         for (UIWindow *window in ((UIWindowScene *)scene).windows) {
+            if (window.hidden || window.bounds.size.width < 100 || window.bounds.size.height < 100) continue;
+            const char *cls = object_getClassName(window);
+            if (cls && (strstr(cls, "Keyboard") || strstr(cls, "TextEffects"))) continue;
             if (window.isKeyWindow) return window;
+            if (!candidate) candidate = window;
         }
     }
-    return UIApplication.sharedApplication.delegate.window;
+    if (candidate) return candidate;
+    UIWindow *fallback = UIApplication.sharedApplication.delegate.window;
+    if (fallback && !fallback.hidden && fallback.bounds.size.width >= 100) return fallback;
+    return nil;
 }
 
 static void EnsureBadge(void) {
@@ -675,13 +687,22 @@ static void EnsureBadge(void) {
     UIWindow *window = KeyWindow();
     if (!window) return;
 
-    // 首页和播放页可能各自创建窗口；浮钮必须跟着当前 key window 走。
-    if (!gBadge) gBadge = [[HGSpeedBadge alloc] initWithFrame:CGRectMake(0, 0, 48, 48)];
+    // 首页和播放页可能各自创建窗口；浮钮必须跟着当前主窗口走。
+    if (!gBadge) {
+        gBadge = [[HGSpeedBadge alloc] initWithFrame:CGRectMake(0, 0, 48, 48)];
+        gBadge.layer.zPosition = 9999.0f;
+    }
     if (gBadge.window != window) {
         [gBadge removeFromSuperview];
         gBadge.center = RestoredCenter(window.bounds.size);
         [window addSubview:gBadge];
+    } else {
+        gBadge.center = ClampCenter(gBadge.center, window.bounds.size);
     }
+    [window bringSubviewToFront:gBadge];
+    gBadge.layer.zPosition = 9999.0f;
+    gBadge.hidden = NO;
+    if (gBadge.alpha < 0.2f) gBadge.alpha = 0.45f;
 
     // 播放器可能晚于浮钮和首轮扫描出现；记忆倍率启用时持续补写已登记对象。
     if (gFreshPlayer || Forcing()) {
